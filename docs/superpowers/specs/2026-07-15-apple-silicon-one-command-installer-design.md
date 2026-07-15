@@ -1,6 +1,6 @@
 # Apple Silicon One-Command Installer Design
 
-Status: Draft for user review
+Status: Approved for implementation
 
 Date: 2026-07-15
 
