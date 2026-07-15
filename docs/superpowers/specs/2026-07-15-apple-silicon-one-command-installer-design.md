@@ -1,7 +1,9 @@
 # Apple Silicon One-Command Installer Design
 
-Status: Draft for user review  
-Date: 2026-07-15  
+Status: Draft for user review
+
+Date: 2026-07-15
+
 Repository: `kubai087/codex-clawd-status-macos`
 
 ## Summary
