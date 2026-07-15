@@ -190,7 +190,7 @@ def install(
     if manage_service:
         _launchctl("bootstrap", _service_domain(), str(paths.launch_agent))
         _launchctl("kickstart", "-k", f"{_service_domain()}/{LABEL}")
-        _wait_for_hub()
+        _wait_for_service_ready()
     return status(home=paths.home, query_live=manage_service)
 
 
@@ -200,14 +200,22 @@ def _http_json(path: str, timeout: float = 2.0) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _wait_for_hub(timeout: float = 15.0) -> None:
+def service_ready(modules: dict) -> bool:
+    return (
+        modules.get("hub", {}).get("status") == "online"
+        and modules.get("codex-watcher", {}).get("status") == "online"
+    )
+
+
+def _wait_for_service_ready(timeout: float = 20.0) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            _http_json("/health", timeout=0.5)
-            return
+            if service_ready(_http_json("/modules", timeout=0.5)):
+                return
         except Exception:
-            time.sleep(0.25)
+            pass
+        time.sleep(0.25)
 
 
 def status(*, home: Path | None = None, query_live: bool = True) -> dict:

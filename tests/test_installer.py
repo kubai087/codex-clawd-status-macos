@@ -6,6 +6,7 @@ from codex_clawd_status_macos.installer import (
     InstallPaths,
     install,
     install_hooks_file,
+    service_ready,
     uninstall,
 )
 
@@ -85,3 +86,13 @@ def test_install_and_uninstall_preserve_previous_skill(tmp_path: Path):
     assert not paths.skill.is_symlink()
     assert (paths.skill / "previous.txt").read_text(encoding="utf-8") == "keep"
     assert expected_command not in paths.hooks.read_text(encoding="utf-8")
+
+
+def test_service_ready_requires_online_watcher():
+    modules = {
+        "hub": {"status": "online"},
+        "codex-watcher": {"status": "offline"},
+    }
+    assert not service_ready(modules)
+    modules["codex-watcher"]["status"] = "online"
+    assert service_ready(modules)

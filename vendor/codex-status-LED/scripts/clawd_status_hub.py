@@ -172,6 +172,12 @@ def file_contains(path: Path, needle: str) -> bool:
         return False
 
 
+def codex_hook_configured(path: Path) -> bool:
+    if file_contains(path, "codex_clawd_hook.py"):
+        return True
+    return file_contains(path, "clawd-status") and file_contains(path, " hook")
+
+
 def normalized_status_effects(data: object | None = None) -> dict[str, dict[str, Any]]:
     result = json.loads(json.dumps(DEFAULT_STATUS_EFFECTS, ensure_ascii=False))
     if isinstance(data, dict):
@@ -795,7 +801,7 @@ class HubState:
             "codex-hook": client_module(
                 "codex-code",
                 "Codex native hook",
-                file_contains(codex_hooks, "codex_clawd_hook.py"),
+                codex_hook_configured(codex_hooks),
             ),
             "codex-vscode": client_module("codex-vscode", "Codex VS Code watcher", True),
             "codex-desktop": client_module("codex-desktop", "Codex Desktop watcher", True),
