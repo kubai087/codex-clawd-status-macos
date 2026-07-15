@@ -19,6 +19,8 @@ import time
 import urllib.request
 from pathlib import Path
 
+from codex_clawd_status_macos.runtime_command import role_command
+
 
 DEFAULT_BAUD = 115200
 DEFAULT_BLE_NAME = "Claude-Mochi-Tank"
@@ -197,17 +199,18 @@ def ensure_session_watcher(args: argparse.Namespace) -> None:
             log(f"watch autostart skipped; missing {watcher}")
             return
 
-        cmd = [sys.executable, str(watcher), "--follow-latest"]
+        watch_args = ["--follow-latest"]
         if args.transport:
-            cmd += ["--transport", args.transport]
+            watch_args += ["--transport", args.transport]
         if args.port:
-            cmd += ["--port", args.port]
+            watch_args += ["--port", args.port]
         if args.baud is not None:
-            cmd += ["--baud", str(args.baud)]
+            watch_args += ["--baud", str(args.baud)]
         if args.ble_address:
-            cmd += ["--ble-address", args.ble_address]
+            watch_args += ["--ble-address", args.ble_address]
         if args.ble_name:
-            cmd += ["--ble-name", args.ble_name]
+            watch_args += ["--ble-name", args.ble_name]
+        cmd = role_command("watch", watch_args)
 
         kwargs: dict = {
             "stdout": subprocess.DEVNULL,
@@ -279,17 +282,18 @@ def ensure_hub(args: argparse.Namespace) -> None:
             log(f"hub autostart skipped; missing {hub}")
             return
 
-        cmd = [sys.executable, str(hub)]
+        hub_args: list[str] = []
         if args.transport:
-            cmd += ["--transport", args.transport]
+            hub_args += ["--transport", args.transport]
         if args.port:
-            cmd += ["--serial-port", args.port]
+            hub_args += ["--serial-port", args.port]
         if args.baud is not None:
-            cmd += ["--baud", str(args.baud)]
+            hub_args += ["--baud", str(args.baud)]
         if args.ble_address:
-            cmd += ["--ble-address", args.ble_address]
+            hub_args += ["--ble-address", args.ble_address]
         if args.ble_name:
-            cmd += ["--ble-name", args.ble_name]
+            hub_args += ["--ble-name", args.ble_name]
+        cmd = role_command("hub", hub_args)
 
         kwargs: dict = {"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
         if os.name == "nt":
@@ -666,17 +670,18 @@ def send_anim(anim: str, transport: str | None = None, port: str | None = None, 
 
 def spawn_timed_transition(event_time: float, args: argparse.Namespace) -> None:
     """Detach a background process: complete -> idle -> sleeping."""
-    cmd = [sys.executable, __file__, "--timed-transition", f"{event_time:.6f}"]
+    transition_args = ["--timed-transition", f"{event_time:.6f}"]
     if args.transport:
-        cmd += ["--transport", args.transport]
+        transition_args += ["--transport", args.transport]
     if args.port:
-        cmd += ["--port", args.port]
+        transition_args += ["--port", args.port]
     if args.baud is not None:
-        cmd += ["--baud", str(args.baud)]
+        transition_args += ["--baud", str(args.baud)]
     if args.ble_address:
-        cmd += ["--ble-address", args.ble_address]
+        transition_args += ["--ble-address", args.ble_address]
     if args.ble_name:
-        cmd += ["--ble-name", args.ble_name]
+        transition_args += ["--ble-name", args.ble_name]
+    cmd = role_command("hook", transition_args)
 
     kwargs: dict = {
         "stdout": subprocess.DEVNULL,

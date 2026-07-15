@@ -23,6 +23,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from codex_clawd_status_macos.runtime_command import role_command
+
 
 LOG_DIR = Path.home() / ".clawd-mochi"
 LOG_PATH = LOG_DIR / "status-hub.log"
@@ -651,7 +653,7 @@ class HubState:
         old_pid = read_pid(WATCH_PID_PATH)
         stop_pid(old_pid)
         time.sleep(0.3)
-        proc = subprocess.Popen([sys.executable, str(watcher), "--follow-latest"], **process_kwargs())
+        proc = subprocess.Popen(role_command("watch", ["--follow-latest"]), **process_kwargs())
         log(f"module restart codex-watcher old_pid={old_pid} new_pid={proc.pid}")
         return {"ok": True, "module": "codex-watcher", "pid": proc.pid}
 
@@ -679,6 +681,15 @@ class HubState:
         return {"ok": False, "error": f"module {module!r} is not restartable"}
 
     def schedule_hub_restart(self, server: ThreadingHTTPServer) -> None:
+        if os.environ.get("CLAWD_STATUS_SUPERVISED") == "1":
+            def stop_supervised_server() -> None:
+                time.sleep(0.2)
+                log("module restart hub via supervisor")
+                server.shutdown()
+
+            threading.Thread(target=stop_supervised_server, daemon=True).start()
+            return
+
         cmd = [
             sys.executable,
             str(Path(__file__).resolve()),
@@ -1419,4 +1430,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
