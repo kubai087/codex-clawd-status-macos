@@ -61,6 +61,8 @@ def test_remote_mode_downloads_verifies_and_installs(tmp_path: Path):
     result, output = run_installer(tmp_path, base=release.as_uri())
 
     assert result.returncode == 0, result.stderr
+    assert f"{ASSET}: OK" not in result.stdout
+    assert f"{ASSET}: OK" in result.stderr
     installed_args = output.read_text().splitlines()
     assert installed_args[0:2] == ["install", "--payload"]
     assert installed_args[2].endswith("/payload")

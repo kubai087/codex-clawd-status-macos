@@ -37,7 +37,7 @@ curl -fsSL "$base/$asset" -o "$temporary/$asset"
 curl -fsSL "$base/$asset.sha256" -o "$temporary/$asset.sha256"
 (
   cd "$temporary"
-  shasum -a 256 -c "$asset.sha256"
+  shasum -a 256 -c "$asset.sha256" >&2
 )
 
 while IFS= read -r member; do
