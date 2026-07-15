@@ -14,6 +14,12 @@ from pathlib import Path
 from .hooks_config import merge_hooks, remove_managed_hooks
 from .launch_agent import LABEL, render_launch_agent
 
+PATH_BLOCK = (
+    "# >>> codex-clawd-status >>>\n"
+    'export PATH="$HOME/.local/bin:$PATH"\n'
+    "# <<< codex-clawd-status <<<\n"
+)
+
 
 @dataclass(frozen=True)
 class InstallPaths:
@@ -73,6 +79,23 @@ def install_hooks_file(path: Path, command: str) -> None:
     else:
         data = {}
     _atomic_json(path, merge_hooks(data, command))
+
+
+def ensure_cli_path(path: Path) -> None:
+    content = path.read_text(encoding="utf-8") if path.exists() else ""
+    if "# >>> codex-clawd-status >>>" in content or "$HOME/.local/bin" in content:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    separator = "" if not content or content.endswith("\n") else "\n"
+    path.write_text(content + separator + PATH_BLOCK, encoding="utf-8")
+
+
+def remove_cli_path(path: Path) -> None:
+    if not path.exists():
+        return
+    content = path.read_text(encoding="utf-8")
+    if PATH_BLOCK in content:
+        path.write_text(content.replace(PATH_BLOCK, "", 1), encoding="utf-8")
 
 
 def _replace_symlink(link: Path, target: Path) -> None:
@@ -165,6 +188,7 @@ def install(
     _replace_symlink(paths.current, release)
     _replace_symlink(paths.stable_binary, paths.current / "bin/clawd-status")
     _replace_symlink(paths.cli_link, paths.stable_binary)
+    ensure_cli_path(paths.home / ".zprofile")
 
     paths.skill.parent.mkdir(parents=True, exist_ok=True)
     if paths.skill.is_symlink():
@@ -280,6 +304,7 @@ def uninstall(
         if backups:
             os.replace(backups[-1], paths.skill)
     paths.cli_link.unlink(missing_ok=True)
+    remove_cli_path(paths.home / ".zprofile")
     paths.launch_agent.unlink(missing_ok=True)
     shutil.rmtree(paths.root, ignore_errors=True)
     if purge:

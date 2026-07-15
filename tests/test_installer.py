@@ -4,8 +4,10 @@ from pathlib import Path
 
 from codex_clawd_status_macos.installer import (
     InstallPaths,
+    ensure_cli_path,
     install,
     install_hooks_file,
+    remove_cli_path,
     service_ready,
     uninstall,
 )
@@ -96,3 +98,18 @@ def test_service_ready_requires_online_watcher():
     assert not service_ready(modules)
     modules["codex-watcher"]["status"] = "online"
     assert service_ready(modules)
+
+
+def test_cli_path_block_is_idempotent_and_removable(tmp_path: Path):
+    zprofile = tmp_path / ".zprofile"
+    zprofile.write_text("export EXISTING=1\n", encoding="utf-8")
+
+    ensure_cli_path(zprofile)
+    first = zprofile.read_text(encoding="utf-8")
+    ensure_cli_path(zprofile)
+
+    assert zprofile.read_text(encoding="utf-8") == first
+    assert 'export PATH="$HOME/.local/bin:$PATH"' in first
+
+    remove_cli_path(zprofile)
+    assert zprofile.read_text(encoding="utf-8") == "export EXISTING=1\n"
