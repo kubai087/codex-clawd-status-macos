@@ -40,6 +40,12 @@ acknowledged as `system-masked` and are not retained. Wake, login, supervisor
 restart, and Hub restart publish `idle` with an empty client table; do not try
 to restore pre-sleep tasks.
 
+Failed wake-time `idle` delivery retries in the background with bounded
+backoff, and any newer display state cancels the old retry. The Hub caches the
+last successful CoreBluetooth address and keeps a healthy Hub alive across a
+wake gap; it restarts the children only when the Hub cannot accept the wake
+reset.
+
 An abrupt Mac power loss cannot send a final command. If the ESP32 is powered
 independently, only a firmware watchdog that clears the LEDs after host
 heartbeats stop can guarantee that stale state is removed.

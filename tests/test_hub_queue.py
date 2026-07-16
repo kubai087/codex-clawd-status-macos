@@ -1,8 +1,20 @@
 import argparse
+import asyncio
+import concurrent.futures
+import sys
 import threading
 import time
+import types
 
-from clawd_status_hub import HubState, LatestDeliveryQueue
+import clawd_status_hub as hub_module
+from clawd_status_hub import (
+    BleSession,
+    HubState,
+    LatestDeliveryQueue,
+    read_cached_ble_address,
+    resolve_ble_address,
+    write_cached_ble_address,
+)
 
 
 def hub_args():
@@ -22,6 +34,115 @@ class CaptureQueue:
     def enqueue(self, delivery):
         self.items.append(delivery)
         return None
+
+
+def test_ble_address_cache_round_trip_and_clear(tmp_path):
+    path = tmp_path / "ble-address"
+
+    write_cached_ble_address("  device-uuid  ", path=path)
+
+    assert read_cached_ble_address(path=path) == "device-uuid"
+    write_cached_ble_address(None, path=path)
+    assert read_cached_ble_address(path=path) is None
+    assert not path.exists()
+
+
+def test_configured_ble_address_wins_over_cached_address(tmp_path):
+    path = tmp_path / "ble-address"
+    write_cached_ble_address("cached-uuid", path=path)
+
+    assert resolve_ble_address("configured-uuid", path=path) == (
+        "configured-uuid"
+    )
+    assert resolve_ble_address(None, path=path) == "cached-uuid"
+
+
+def test_ble_selection_updates_persistent_address(monkeypatch):
+    saved = []
+    monkeypatch.setattr(hub_module, "write_cached_ble_address", saved.append)
+    session = object.__new__(BleSession)
+    session.target = None
+    session.address = None
+    session.name = "Claude-Mochi-Tank"
+    session.client = object()
+
+    session.select("  device-uuid  ")
+    session.select("")
+
+    assert saved == ["device-uuid", None]
+
+
+def test_ble_reset_with_clear_removes_persistent_address(monkeypatch):
+    saved = []
+    monkeypatch.setattr(hub_module, "write_cached_ble_address", saved.append)
+    session = object.__new__(BleSession)
+    session.target = "device-uuid"
+    session.address = "device-uuid"
+    session.client = None
+    session.disconnect = lambda: (True, "disconnected")
+
+    session.reset(clear_target=True)
+
+    assert session.target is None
+    assert session.address is None
+    assert saved == [None]
+
+
+def test_failed_cached_target_is_cleared_before_retry_scan(monkeypatch):
+    saved = []
+
+    class FailingClient:
+        def __init__(self, _target, timeout):
+            assert timeout == 5.0
+
+        async def connect(self):
+            raise RuntimeError("stale target")
+
+    bleak = types.SimpleNamespace(BleakClient=FailingClient, BleakScanner=object)
+    monkeypatch.setitem(sys.modules, "bleak", bleak)
+    monkeypatch.setattr(hub_module, "write_cached_ble_address", saved.append)
+    session = object.__new__(BleSession)
+    session.target = "cached-uuid"
+    session.address = "cached-uuid"
+    session.name = "Claude-Mochi-Tank"
+    session.client = None
+
+    ok, message = asyncio.run(session._connect())
+
+    assert ok is False
+    assert "stale target" in message
+    assert session.target is None
+    assert session.address is None
+    assert saved == [None]
+
+
+def test_ble_send_cancels_timed_out_coroutine(monkeypatch):
+    cancelled = []
+
+    class Future:
+        def result(self, timeout):
+            assert timeout == 0.01
+            raise concurrent.futures.TimeoutError
+
+        def cancel(self):
+            cancelled.append(True)
+
+    def run_coroutine(coroutine, _loop):
+        coroutine.close()
+        return Future()
+
+    monkeypatch.setattr(
+        hub_module.asyncio,
+        "run_coroutine_threadsafe",
+        run_coroutine,
+    )
+    session = object.__new__(BleSession)
+    session.loop = object()
+
+    result = session.send({"anim": "idle"}, timeout=0.01)
+
+    assert result == (False, "BLE send timed out after 0.01s")
+    assert cancelled == [True]
 
 
 def test_queue_returns_before_delivery_finishes():
@@ -98,6 +219,48 @@ def test_queue_never_delivers_concurrently():
         time.sleep(0.01)
     assert delivered == ["building", "happy"]
     assert maximum == 1
+
+
+def test_queue_retries_failed_system_idle_without_a_new_ide_event():
+    attempts = []
+    delivered = threading.Event()
+
+    def deliver(item):
+        attempts.append((item["anim"], item.get("_retry_attempt", 0)))
+        if len(attempts) == 1:
+            return {"ok": False, "status": "failed"}
+        delivered.set()
+        return {"ok": True, "status": "delivered"}
+
+    queue = LatestDeliveryQueue(deliver, retry_delays=(0.01,))
+    queue.enqueue({"anim": "idle", "_retry_on_failure": True})
+
+    assert delivered.wait(1)
+    assert attempts == [("idle", 0), ("idle", 1)]
+
+
+def test_newer_display_state_cancels_pending_idle_retry():
+    attempts = []
+    failed = threading.Event()
+    delivered = threading.Event()
+
+    def deliver(item):
+        attempts.append(item["anim"])
+        if item["anim"] == "idle":
+            failed.set()
+            return {"ok": False, "status": "failed"}
+        delivered.set()
+        return {"ok": True, "status": "delivered"}
+
+    queue = LatestDeliveryQueue(deliver, retry_delays=(0.2,))
+    queue.enqueue({"anim": "idle", "_retry_on_failure": True})
+    assert failed.wait(1)
+
+    queue.enqueue({"anim": "thinking"})
+
+    assert delivered.wait(1)
+    time.sleep(0.25)
+    assert attempts == ["idle", "thinking"]
 
 
 def test_hub_enqueue_marks_platform_queued_without_delivery():
@@ -392,6 +555,7 @@ def test_system_wake_publishes_idle_without_restoring_old_work():
     assert state["current_client_id"] == "macos-power"
     assert state["current_status"] == "idle"
     assert queue.items[-1]["anim"] == "idle"
+    assert queue.items[-1]["_retry_on_failure"] is True
 
 
 def test_invalid_system_power_state_is_rejected_without_resetting_tasks():

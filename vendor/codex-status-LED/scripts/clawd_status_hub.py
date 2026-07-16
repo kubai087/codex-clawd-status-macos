@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import ctypes
 import importlib
 import json
@@ -32,6 +33,7 @@ EVENTS_LIMIT = 300
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 EFFECTS_PATH = LOG_DIR / "status-effects.json"
+BLE_ADDRESS_PATH = LOG_DIR / "ble-address"
 
 STATUS_LABELS = {
     "idle": "空闲",
@@ -106,6 +108,33 @@ def write_pid() -> None:
         PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
     except OSError:
         pass
+
+
+def read_cached_ble_address(path: Path = BLE_ADDRESS_PATH) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def write_cached_ble_address(
+    address: str | None, path: Path = BLE_ADDRESS_PATH
+) -> None:
+    value = str(address or "").strip()
+    try:
+        if not value:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(value + "\n", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def resolve_ble_address(
+    configured: str | None, path: Path = BLE_ADDRESS_PATH
+) -> str | None:
+    return str(configured or "").strip() or read_cached_ble_address(path)
 
 
 def acquire_file_lock(path: Path, stale_seconds: float = 30.0) -> bool:
@@ -252,10 +281,14 @@ class BleSession:
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    def send(self, command: str | dict, timeout: float = 8.0) -> tuple[bool, str]:
+    def send(self, command: str | dict, timeout: float = 10.0) -> tuple[bool, str]:
         fut = asyncio.run_coroutine_threadsafe(self._send(command), self.loop)
         try:
             return fut.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            fut.cancel()
+            self.client = None
+            return False, f"BLE send timed out after {timeout:g}s"
         except Exception as exc:
             return False, str(exc)
 
@@ -269,6 +302,7 @@ class BleSession:
     def select(self, address: str, name: str | None = None) -> None:
         self.target = address.strip() or None
         self.address = self.target
+        write_cached_ble_address(self.target)
         if name:
             self.name = name
         self.client = None
@@ -293,6 +327,7 @@ class BleSession:
         if clear_target:
             self.target = None
             self.address = None
+            write_cached_ble_address(None)
 
     def status(self) -> dict[str, Any]:
         connected = bool(self.client is not None and getattr(self.client, "is_connected", False))
@@ -359,6 +394,7 @@ class BleSession:
                 if (device.name or "").startswith(self.name):
                     self.target = device.address
                     self.address = self.target
+                    write_cached_ble_address(self.target)
                     break
         if not self.target:
             return False, f"BLE device not found name={self.name!r}"
@@ -366,9 +402,13 @@ class BleSession:
         try:
             self.client = BleakClient(self.target, timeout=5.0)
             await self.client.connect()
+            write_cached_ble_address(self.target)
             return True, f"BLE connected {self.target}"
         except Exception as exc:
             self.client = None
+            self.target = None
+            self.address = None
+            write_cached_ble_address(None)
             return False, f"BLE connect failed: {exc}"
 
     async def _disconnect(self) -> tuple[bool, str]:
@@ -479,8 +519,14 @@ class SerialSession:
 class LatestDeliveryQueue:
     """Serialize device writes while retaining only the newest pending state."""
 
-    def __init__(self, deliver) -> None:
+    def __init__(
+        self,
+        deliver,
+        *,
+        retry_delays: tuple[float, ...] = (1.0, 2.0, 4.0, 8.0, 30.0),
+    ) -> None:
         self.deliver = deliver
+        self.retry_delays = retry_delays
         self.condition = threading.Condition()
         self.pending: dict[str, Any] | None = None
         threading.Thread(target=self._run, daemon=True).start()
@@ -500,9 +546,26 @@ class LatestDeliveryQueue:
                 delivery = self.pending
                 self.pending = None
             try:
-                self.deliver(delivery)
+                result = self.deliver(delivery)
             except Exception as exc:
                 log(f"queued delivery failed: {exc}")
+                continue
+            if not delivery.get("_retry_on_failure"):
+                continue
+            if not isinstance(result, dict) or result.get("status") != "failed":
+                continue
+            attempt = int(delivery.get("_retry_attempt") or 0)
+            delay = self.retry_delays[min(attempt, len(self.retry_delays) - 1)]
+            with self.condition:
+                if self.pending is not None:
+                    continue
+                self.condition.wait(timeout=delay)
+                if self.pending is not None:
+                    continue
+                retry = dict(delivery)
+                retry["_retry_attempt"] = attempt + 1
+                self.pending = retry
+                self.condition.notify()
 
 
 class HubState:
@@ -963,6 +1026,7 @@ class HubState:
             "anim": status,
             "event": reason,
             "tool": "",
+            "_retry_on_failure": not sleeping,
         }
         with self.arbitration_condition:
             self.arbiter = StatusArbiter(clock=self.clock)
@@ -1827,6 +1891,7 @@ def main() -> int:
     parser.add_argument("--ble-name", default=os.environ.get("CLAWD_TANK_BLE_NAME", bridge.DEFAULT_BLE_NAME))
     args = parser.parse_args()
     args.port = args.port_override
+    args.ble_address = resolve_ble_address(args.ble_address)
 
     try:
         if not acquire_file_lock(RUN_LOCK_PATH):
