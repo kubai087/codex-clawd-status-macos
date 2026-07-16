@@ -141,6 +141,22 @@ class Child:
             self.process.wait(timeout=5)
 
 
+def recover_after_wake(
+    hub: Child,
+    watcher: Child,
+    *,
+    health_check: Callable[[], bool] = hub_is_healthy,
+    sender: Callable[[str, str], bool] = post_system_power_state,
+    pause: Callable[[float], None] = time.sleep,
+) -> bool:
+    if health_check() and sender("awake", "wake-gap"):
+        return False
+    watcher.stop()
+    hub.stop()
+    pause(2.0)
+    return True
+
+
 def run(poll_seconds: float = 5.0, wake_threshold: float = 20.0) -> int:
     hub = Child("hub", ("--transport", "auto"))
     watcher = Child("watch", ("--follow-latest",))
@@ -161,9 +177,7 @@ def run(poll_seconds: float = 5.0, wake_threshold: float = 20.0) -> int:
             woke = is_wake_gap(previous, current, wake_threshold)
             previous = current
             if woke:
-                watcher.stop()
-                hub.stop()
-                time.sleep(2)
+                recover_after_wake(hub, watcher)
             hub.ensure()
             if hub_is_healthy():
                 watcher.ensure()

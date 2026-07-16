@@ -58,6 +58,11 @@ Task events received during sleep are acknowledged but discarded. After wake,
 login, service restart, or Hub restart, the runtime starts from `idle`; it never
 restores task state captured before sleep.
 
+When a wake-time `idle` command reaches macOS before Bluetooth is ready, the
+delivery worker retries in the background with bounded backoff. A newer task
+state supersedes that retry. The last successful CoreBluetooth device address
+is cached so healthy wake cycles can reconnect directly without a fresh scan.
+
 This behavior covers normal macOS sleep and graceful shutdown. If the Mac loses
 power abruptly while the ESP32 has an independent power source, the Mac cannot
 send a final command. A firmware watchdog that turns the LEDs off after host

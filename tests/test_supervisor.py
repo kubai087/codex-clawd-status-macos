@@ -6,6 +6,7 @@ from codex_clawd_status_macos.supervisor import (
     next_backoff,
     post_system_power_state,
     power_callbacks,
+    recover_after_wake,
 )
 
 
@@ -74,4 +75,49 @@ def test_power_callbacks_send_sleep_and_wake():
     assert calls == [
         ("sleeping", "system-will-sleep"),
         ("awake", "system-has-powered-on"),
+    ]
+
+
+def test_healthy_hub_is_reset_without_restarting_children_after_wake():
+    calls = []
+
+    class Child:
+        def stop(self):
+            calls.append("stop")
+
+    restarted = recover_after_wake(
+        Child(),
+        Child(),
+        health_check=lambda: True,
+        sender=lambda state, reason: calls.append((state, reason)) or True,
+        pause=lambda _seconds: calls.append("pause"),
+    )
+
+    assert restarted is False
+    assert calls == [("awake", "wake-gap")]
+
+
+def test_failed_wake_reset_restarts_children_as_fallback():
+    calls = []
+
+    class Child:
+        def __init__(self, name):
+            self.name = name
+
+        def stop(self):
+            calls.append(("stop", self.name))
+
+    restarted = recover_after_wake(
+        Child("hub"),
+        Child("watcher"),
+        health_check=lambda: True,
+        sender=lambda _state, _reason: False,
+        pause=lambda seconds: calls.append(("pause", seconds)),
+    )
+
+    assert restarted is True
+    assert calls == [
+        ("stop", "watcher"),
+        ("stop", "hub"),
+        ("pause", 2.0),
     ]
