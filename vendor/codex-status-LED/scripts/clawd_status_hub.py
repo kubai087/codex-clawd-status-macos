@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Local Clawd hook hub with a small visual dashboard.
-
-The hub accepts Codex/Claude hook deliveries on /hook, keeps transport state,
-and forwards animations to the ESP32 by BLE or serial.
-"""
+"""Local multi-platform Clawd hook hub with a small visual dashboard."""
 
 from __future__ import annotations
 
@@ -176,6 +172,14 @@ def codex_hook_configured(path: Path) -> bool:
     if file_contains(path, "codex_clawd_hook.py"):
         return True
     return file_contains(path, "clawd-status") and file_contains(path, " hook")
+
+
+def buddy_hook_configured(path: Path, platform: str) -> bool:
+    if file_contains(path, "workbuddy_clawd_hook.py"):
+        return True
+    return file_contains(path, "buddy-hook") and file_contains(
+        path, f"--platform {platform}"
+    )
 
 
 def normalized_status_effects(data: object | None = None) -> dict[str, dict[str, Any]]:
@@ -471,6 +475,33 @@ class SerialSession:
         self.ser = None
 
 
+class LatestDeliveryQueue:
+    """Serialize device writes while retaining only the newest pending state."""
+
+    def __init__(self, deliver) -> None:
+        self.deliver = deliver
+        self.condition = threading.Condition()
+        self.pending: dict[str, Any] | None = None
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def enqueue(self, delivery: dict[str, Any]) -> None:
+        with self.condition:
+            self.pending = dict(delivery)
+            self.condition.notify()
+
+    def _run(self) -> None:
+        while True:
+            with self.condition:
+                while self.pending is None:
+                    self.condition.wait()
+                delivery = self.pending
+                self.pending = None
+            try:
+                self.deliver(delivery)
+            except Exception as exc:
+                log(f"queued delivery failed: {exc}")
+
+
 class HubState:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -501,6 +532,7 @@ class HubState:
         }
         self.ble = BleSession(args.ble_name, args.ble_address)
         self.serial = SerialSession(args.port, args.baud)
+        self.delivery_queue = LatestDeliveryQueue(self.deliver)
 
     def scan_serial(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -747,7 +779,8 @@ class HubState:
 
     def modules_locked(self) -> dict[str, dict[str, Any]]:
         codex_hooks = Path.home() / ".codex" / "hooks.json"
-        claude_settings = Path.home() / ".claude" / "settings.json"
+        codebuddy_settings = Path.home() / ".codebuddy" / "settings.json"
+        workbuddy_settings = Path.home() / ".workbuddy" / "settings.json"
         watcher_pid = read_pid(WATCH_PID_PATH)
         serial_port = ""
         try:
@@ -812,10 +845,15 @@ class HubState:
                 "last_at": None,
                 "restartable": True,
             },
-            "claude-hook": client_module(
-                "claude-code",
-                "Claude Code hook",
-                file_contains(claude_settings, "claude_clawd_hook.py"),
+            "codebuddy-hook": client_module(
+                "codebuddy",
+                "CodeBuddy native hook",
+                buddy_hook_configured(codebuddy_settings, "codebuddy"),
+            ),
+            "workbuddy-hook": client_module(
+                "workbuddy",
+                "WorkBuddy native hook",
+                buddy_hook_configured(workbuddy_settings, "workbuddy"),
             ),
             "esp32": {
                 "label": "ESP32 display",
@@ -836,6 +874,73 @@ class HubState:
             self.events.append(item)
             if len(self.events) > EVENTS_LIMIT:
                 del self.events[: len(self.events) - EVENTS_LIMIT]
+
+    def enqueue(self, delivery: dict[str, Any]) -> dict[str, Any]:
+        command = self.device_command(delivery)
+        if not command.get("anim") and not any(
+            key in delivery for key in ("effect", "steps", "leds", "led", "mask")
+        ):
+            return {"ok": False, "error": "missing anim or effect"}
+
+        source = str(delivery.get("source") or "manual")
+        client_id = str(delivery.get("client_id") or source)
+        client_kind = str(delivery.get("client_kind") or source)
+        event = str(delivery.get("event") or "")
+        tool = str(delivery.get("tool") or "")
+        anim = str(delivery.get("anim") or "custom")
+        timestamp = time.time()
+        hook_key = f"{client_id}:{event}" if event else client_id
+        hook_state = {
+            "status": "queued",
+            "last_anim": anim,
+            "last_tool": tool,
+            "last_source": source,
+            "last_client_id": client_id,
+            "last_client_kind": client_kind,
+            "last_at": timestamp,
+        }
+        with self.lock:
+            client = self.clients.setdefault(
+                client_id,
+                {
+                    "client_id": client_id,
+                    "kind": client_kind,
+                    "source": source,
+                    "hooks": {},
+                    "delivered_count": 0,
+                    "failed_count": 0,
+                },
+            )
+            client.update(
+                {
+                    "kind": client_kind,
+                    "source": source,
+                    "status": "queued",
+                    "last_at": timestamp,
+                    "last_anim": anim,
+                    "last_event": event,
+                    "last_tool": tool,
+                }
+            )
+            if event:
+                self.hooks[hook_key] = {"event": event, **hook_state}
+                client.setdefault("hooks", {})[event] = hook_state
+            self.state.update(
+                {
+                    "current_anim": anim,
+                    "current_source": source,
+                    "current_client_id": client_id,
+                    "current_client_kind": client_kind,
+                    "current_event": event,
+                    "current_tool": tool,
+                    "current_status": status_for_anim(anim),
+                    "transport_status": "queued",
+                    "last_hook_at": timestamp,
+                    "last_error": None,
+                }
+            )
+        self.delivery_queue.enqueue(delivery)
+        return {"ok": True, "status": "queued"}
 
     def deliver(self, delivery: dict[str, Any]) -> dict[str, Any]:
         payload = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
@@ -1227,7 +1332,9 @@ function renderStatusBar(s){
   const m=s.modules||{};
   const items=[
     ["Hub",m.hub||{status:"offline",detail:""},""],
-    ["Hook",m["codex-hook"]||{status:"missing",detail:""},""],
+    ["Codex",m["codex-hook"]||{status:"missing",detail:""},""],
+    ["CodeBuddy",m["codebuddy-hook"]||{status:"missing",detail:""},""],
+    ["WorkBuddy",m["workbuddy-hook"]||{status:"missing",detail:""},""],
     ["Watcher",m["codex-watcher"]||{status:"offline",detail:""},"codex-watcher"],
     ["设备",m.esp32||{status:s.transport_status||"idle",detail:s.transport_message||""},""]
   ];
@@ -1377,6 +1484,8 @@ class HubHandler(BaseHTTPRequestHandler):
             data = self.read_json()
             if path == "/hook":
                 self.send_json(self.hub.deliver(data))
+            elif path == "/enqueue":
+                self.send_json(self.hub.enqueue(data))
             elif path == "/send":
                 data.setdefault("source", "manual")
                 data.setdefault("client_id", "manual")
