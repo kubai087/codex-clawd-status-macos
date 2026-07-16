@@ -10,7 +10,9 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
+from .buddy_hooks_config import merge_buddy_hooks, remove_managed_buddy_hooks
 from .hooks_config import merge_hooks, remove_managed_hooks
 from .launch_agent import LABEL, render_launch_agent
 
@@ -30,8 +32,12 @@ class InstallPaths:
     cli_link: Path
     launch_agent: Path
     logs: Path
-    skill: Path
-    hooks: Path
+    codex_skill: Path
+    codebuddy_skill: Path
+    workbuddy_skill: Path
+    codex_hooks: Path
+    codebuddy_settings: Path
+    workbuddy_settings: Path
 
     @classmethod
     def for_home(cls, home: Path) -> "InstallPaths":
@@ -46,9 +52,24 @@ class InstallPaths:
                 home / "Library/LaunchAgents/com.kubai087.codex-clawd-status.plist"
             ),
             logs=home / "Library/Logs/CodexClawdStatus",
-            skill=home / ".codex/skills/codex-clawd-status",
-            hooks=home / ".codex/hooks.json",
+            codex_skill=home / ".codex/skills/codex-clawd-status",
+            codebuddy_skill=home / ".codebuddy/skills/codex-clawd-status",
+            workbuddy_skill=home / ".workbuddy/skills/codex-clawd-status",
+            codex_hooks=home / ".codex/hooks.json",
+            codebuddy_settings=home / ".codebuddy/settings.json",
+            workbuddy_settings=home / ".workbuddy/settings.json",
         )
+
+    @property
+    def skill(self) -> Path:
+        return self.codex_skill
+
+    @property
+    def hooks(self) -> Path:
+        return self.codex_hooks
+
+    def skill_paths(self) -> tuple[Path, Path, Path]:
+        return self.codex_skill, self.codebuddy_skill, self.workbuddy_skill
 
 
 def _atomic_json(path: Path, data: dict) -> None:
@@ -65,11 +86,15 @@ def _atomic_json(path: Path, data: dict) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def install_hooks_file(path: Path, command: str) -> None:
+def _install_json_file(
+    path: Path,
+    command: str,
+    merge: Callable[[dict, str], dict],
+) -> None:
     if path.exists():
         data = json.loads(path.read_text(encoding="utf-8"))
         existing_backups = list(
-            path.parent.glob("hooks.json.codex-clawd-status.bak.*")
+            path.parent.glob(f"{path.name}.codex-clawd-status.bak.*")
         )
         if not existing_backups:
             backup = path.with_name(
@@ -78,7 +103,15 @@ def install_hooks_file(path: Path, command: str) -> None:
             shutil.copy2(path, backup)
     else:
         data = {}
-    _atomic_json(path, merge_hooks(data, command))
+    _atomic_json(path, merge(data, command))
+
+
+def install_hooks_file(path: Path, command: str) -> None:
+    _install_json_file(path, command, merge_hooks)
+
+
+def install_buddy_settings_file(path: Path, command: str) -> None:
+    _install_json_file(path, command, merge_buddy_hooks)
 
 
 def ensure_cli_path(path: Path) -> None:
@@ -104,6 +137,29 @@ def _replace_symlink(link: Path, target: Path) -> None:
     temporary.unlink(missing_ok=True)
     temporary.symlink_to(target)
     os.replace(temporary, link)
+
+
+def _install_skill(skill: Path, target: Path) -> None:
+    skill.parent.mkdir(parents=True, exist_ok=True)
+    if skill.is_symlink():
+        skill.unlink()
+    elif skill.exists():
+        backup = skill.with_name(
+            f"{skill.name}.pre-macos-installer.{int(time.time())}"
+        )
+        os.replace(skill, backup)
+    skill.symlink_to(target)
+
+
+def _remove_skill(skill: Path) -> None:
+    if not skill.is_symlink():
+        return
+    skill.unlink()
+    backups = sorted(
+        skill.parent.glob(f"{skill.name}.pre-macos-installer.*")
+    )
+    if backups:
+        os.replace(backups[-1], skill)
 
 
 def _launchctl(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -154,6 +210,11 @@ def _managed_hook_command(paths: InstallPaths) -> str:
     return f"{shlex.quote(str(paths.stable_binary))} hook"
 
 
+def _managed_buddy_command(paths: InstallPaths, platform: str) -> str:
+    binary = shlex.quote(str(paths.stable_binary))
+    return f"{binary} buddy-hook --platform {platform}"
+
+
 def install(
     payload: Path,
     version: str,
@@ -190,17 +251,19 @@ def install(
     _replace_symlink(paths.cli_link, paths.stable_binary)
     ensure_cli_path(paths.home / ".zprofile")
 
-    paths.skill.parent.mkdir(parents=True, exist_ok=True)
-    if paths.skill.is_symlink():
-        paths.skill.unlink()
-    elif paths.skill.exists():
-        backup = paths.skill.with_name(
-            f"{paths.skill.name}.pre-macos-installer.{int(time.time())}"
-        )
-        os.replace(paths.skill, backup)
-    paths.skill.symlink_to(paths.current / "share/codex-clawd-status/skill")
+    skill_target = paths.current / "share/codex-clawd-status/skill"
+    for skill in paths.skill_paths():
+        _install_skill(skill, skill_target)
 
-    install_hooks_file(paths.hooks, _managed_hook_command(paths))
+    install_hooks_file(paths.codex_hooks, _managed_hook_command(paths))
+    install_buddy_settings_file(
+        paths.codebuddy_settings,
+        _managed_buddy_command(paths, "codebuddy"),
+    )
+    install_buddy_settings_file(
+        paths.workbuddy_settings,
+        _managed_buddy_command(paths, "workbuddy"),
+    )
     paths.logs.mkdir(parents=True, exist_ok=True)
     paths.launch_agent.parent.mkdir(parents=True, exist_ok=True)
     paths.launch_agent.write_bytes(
@@ -287,22 +350,30 @@ def uninstall(
         )
         _stop_legacy_processes(paths.home)
 
-    if paths.hooks.exists():
-        data = json.loads(paths.hooks.read_text(encoding="utf-8"))
+    if paths.codex_hooks.exists():
+        data = json.loads(paths.codex_hooks.read_text(encoding="utf-8"))
         _atomic_json(
-            paths.hooks,
+            paths.codex_hooks,
             remove_managed_hooks(data, _managed_hook_command(paths)),
         )
 
-    if paths.skill.is_symlink():
-        paths.skill.unlink()
-        backups = sorted(
-            paths.skill.parent.glob(
-                f"{paths.skill.name}.pre-macos-installer.*"
-            )
+    for settings, platform in (
+        (paths.codebuddy_settings, "codebuddy"),
+        (paths.workbuddy_settings, "workbuddy"),
+    ):
+        if not settings.exists():
+            continue
+        data = json.loads(settings.read_text(encoding="utf-8"))
+        _atomic_json(
+            settings,
+            remove_managed_buddy_hooks(
+                data,
+                _managed_buddy_command(paths, platform),
+            ),
         )
-        if backups:
-            os.replace(backups[-1], paths.skill)
+
+    for skill in paths.skill_paths():
+        _remove_skill(skill)
     paths.cli_link.unlink(missing_ok=True)
     remove_cli_path(paths.home / ".zprofile")
     paths.launch_agent.unlink(missing_ok=True)
