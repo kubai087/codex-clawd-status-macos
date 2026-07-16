@@ -110,8 +110,10 @@ def main() -> int:
         shared.log(
             f"[{args.platform}] mapped event={event!r} tool={tool!r} anim={anim}"
         )
-        shared.deliver_anim(anim, args, payload=payload, event_time=event_time)
-        if event == "Stop":
+        delivery_mode = shared.deliver_anim(
+            anim, args, payload=payload, event_time=event_time
+        )
+        if event == "Stop" and delivery_mode == "direct":
             shared.spawn_timed_transition(event_time, args)
     return 0
 
