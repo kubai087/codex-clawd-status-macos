@@ -328,3 +328,136 @@ def test_recompute_after_completion_expiry_restores_working_session():
     assert hub.snapshot()["aggregate"]["effective_client_key"] == (
         "codex-desktop:A"
     )
+
+
+def test_system_sleep_clears_sessions_and_enqueues_sleeping():
+    hub = HubState(hub_args(), start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+    hub.enqueue(
+        {
+            "client_id": "codex-desktop",
+            "session_id": "A",
+            "anim": "thinking",
+        }
+    )
+
+    result = hub.set_system_power_state("sleeping", "system-will-sleep")
+
+    state = hub.snapshot()
+    assert result["ok"] is True
+    assert state["system_power_state"] == "sleeping"
+    assert state["system_override"] is True
+    assert state["clients"] == {}
+    assert queue.items[-1]["anim"] == "sleeping"
+
+
+def test_lifecycle_event_is_masked_while_sleeping():
+    hub = HubState(hub_args(), start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+    hub.set_system_power_state("sleeping", "test")
+
+    result = hub.enqueue(
+        {
+            "client_id": "workbuddy",
+            "session_id": "B",
+            "anim": "confused",
+        }
+    )
+
+    assert result["display_role"] == "system-masked"
+    assert result["display_changed"] is False
+    assert hub.snapshot()["clients"] == {}
+
+
+def test_system_wake_publishes_idle_without_restoring_old_work():
+    hub = HubState(hub_args(), start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+    hub.enqueue(
+        {
+            "client_id": "codex-desktop",
+            "session_id": "A",
+            "anim": "thinking",
+        }
+    )
+    hub.set_system_power_state("sleeping", "test")
+
+    hub.set_system_power_state("awake", "system-has-powered-on")
+
+    state = hub.snapshot()
+    assert state["system_override"] is False
+    assert state["clients"] == {}
+    assert state["current_client_id"] == "macos-power"
+    assert state["current_status"] == "idle"
+    assert queue.items[-1]["anim"] == "idle"
+
+
+def test_invalid_system_power_state_is_rejected_without_resetting_tasks():
+    hub = HubState(hub_args(), start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+    hub.enqueue(
+        {
+            "client_id": "codex-desktop",
+            "session_id": "A",
+            "anim": "thinking",
+        }
+    )
+
+    result = hub.set_system_power_state("unknown", "test")
+
+    assert result == {
+        "ok": False,
+        "error": "expected state awake or sleeping",
+    }
+    assert "codex-desktop:A" in hub.snapshot()["clients"]
+    assert [item["anim"] for item in queue.items] == ["thinking"]
+
+
+def test_system_delivery_does_not_create_a_task_client():
+    hub = HubState(hub_args(), start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+    hub.send_by_transport = lambda _command, transport: (True, transport)
+    hub.set_system_power_state("sleeping", "test")
+
+    result = hub.deliver(queue.items[-1])
+
+    assert result["status"] == "delivered"
+    assert hub.snapshot()["clients"] == {}
+
+
+def test_in_flight_task_cannot_restore_state_after_system_sleep():
+    hub = HubState(hub_args(), start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_send(_command, transport):
+        started.set()
+        release.wait(1)
+        return True, transport
+
+    hub.send_by_transport = delayed_send
+    delivery = {
+        "source": "codex",
+        "client_id": "codex-desktop",
+        "client_kind": "codex",
+        "session_id": "A",
+        "anim": "thinking",
+    }
+    thread = threading.Thread(target=hub.deliver, args=(delivery,))
+    thread.start()
+    assert started.wait(1)
+
+    hub.set_system_power_state("sleeping", "test")
+    release.set()
+    thread.join(1)
+
+    state = hub.snapshot()
+    assert state["clients"] == {}
+    assert state["current_status"] == "sleeping"
+    assert state["current_client_id"] == "macos-power"

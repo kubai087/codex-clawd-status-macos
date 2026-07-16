@@ -536,6 +536,11 @@ class HubState:
         self.use_status_effects = os.environ.get("CLAWD_TANK_USE_STATUS_EFFECTS", "0").lower() in {"1", "true", "yes", "on"}
         self.state: dict[str, Any] = {
             "started_at": now_iso(),
+            "system_power_state": "awake",
+            "system_override": False,
+            "system_reason": "initializing",
+            "system_changed_at": self.clock(),
+            "system_epoch": 0,
             "current_anim": None,
             "current_source": None,
             "current_client_id": None,
@@ -936,6 +941,74 @@ class HubState:
                 self.clock() if now is None else float(now)
             )
 
+    def set_system_power_state(
+        self, state: str, reason: str = ""
+    ) -> dict[str, Any]:
+        if state not in {"awake", "sleeping"}:
+            return {
+                "ok": False,
+                "error": "expected state awake or sleeping",
+            }
+
+        timestamp = self.clock()
+        sleeping = state == "sleeping"
+        status = "sleeping" if sleeping else "idle"
+        delivery = {
+            "source": "system",
+            "client_id": "macos-power",
+            "client_kind": "system",
+            "client_key": "macos-power",
+            "session_id": "",
+            "status": status,
+            "anim": status,
+            "event": reason,
+            "tool": "",
+        }
+        with self.arbitration_condition:
+            self.arbiter = StatusArbiter(clock=self.clock)
+            self.clients.clear()
+            self.hooks.clear()
+            self.aggregate = {
+                "effective_client_key": None,
+                "effective_status": "idle",
+                "active_count": 0,
+                "waiting_count": 0,
+                "working_count": 0,
+                "error_count": 0,
+                "next_deadline": None,
+            }
+            epoch = int(self.state.get("system_epoch") or 0) + 1
+            self.state.update(
+                {
+                    "system_power_state": state,
+                    "system_override": sleeping,
+                    "system_reason": reason,
+                    "system_changed_at": timestamp,
+                    "system_epoch": epoch,
+                    "current_anim": status,
+                    "current_source": "system",
+                    "current_client_id": "macos-power",
+                    "current_client_key": "macos-power",
+                    "current_client_kind": "system",
+                    "current_session_id": "",
+                    "current_event": reason,
+                    "current_tool": "",
+                    "current_status": status,
+                    "last_hook_at": timestamp,
+                    "last_error": None,
+                    "transport_status": "queued",
+                }
+            )
+            delivery["_system_epoch"] = epoch
+            replaced = self.delivery_queue.enqueue(delivery)
+            if replaced is not None:
+                self._record_coalesced_locked(replaced, timestamp)
+            self.last_published_fingerprint = ("macos-power", status, status)
+            self.arbitration_condition.notify_all()
+
+        log(f"system power state={state} reason={reason!r}")
+        return {"ok": True, "state": state, "status": "queued"}
+
     def _recompute_aggregate_locked(self, now: float) -> bool:
         decision = self.arbiter.evaluate(now)
         changed = self._publish_decision_locked(decision, now)
@@ -1085,6 +1158,14 @@ class HubState:
             "last_at": timestamp,
         }
         with self.arbitration_condition:
+            if self.state.get("system_override"):
+                return {
+                    "ok": True,
+                    "status": "queued",
+                    "client_key": key,
+                    "display_role": "system-masked",
+                    "display_changed": False,
+                }
             decision = self.arbiter.update(normalized, now=timestamp)
             client = self.clients.setdefault(
                 key,
@@ -1138,6 +1219,7 @@ class HubState:
         client_key = str(
             delivery.get("client_key") or arbiter_client_key(delivery)
         )
+        is_system = source == "system" or client_kind == "system"
         event = str(delivery.get("event") or payload.get("hook_event_name") or payload.get("event") or "")
         tool = str(delivery.get("tool") or payload.get("tool_name") or payload.get("toolName") or "")
 
@@ -1166,22 +1248,32 @@ class HubState:
         hook_key = f"{client_key}:{event}" if event else client_key
 
         with self.lock:
-            client = self.clients.setdefault(
-                client_key,
-                {
-                    "client_key": client_key,
-                    "client_id": client_id,
-                    "kind": client_kind,
-                    "source": source,
-                    "session_id": session_id,
-                    "status": "idle",
-                    "hooks": {},
-                    "delivered_count": 0,
-                    "failed_count": 0,
-                    "last_at": None,
-                },
-            )
-            client.update({"kind": client_kind, "source": source, "status": "sending", "last_at": ts})
+            delivery_epoch = int(self.state.get("system_epoch") or 0)
+            if self.state.get("system_override") and not is_system:
+                return {
+                    "ok": True,
+                    "status": "system-masked",
+                    "elapsed_ms": 0,
+                    "results": [],
+                }
+            client = None
+            if not is_system:
+                client = self.clients.setdefault(
+                    client_key,
+                    {
+                        "client_key": client_key,
+                        "client_id": client_id,
+                        "kind": client_kind,
+                        "source": source,
+                        "session_id": session_id,
+                        "status": "idle",
+                        "hooks": {},
+                        "delivered_count": 0,
+                        "failed_count": 0,
+                        "last_at": None,
+                    },
+                )
+                client.update({"kind": client_kind, "source": source, "status": "sending", "last_at": ts})
             self.state.update(
                 {
                     "current_anim": anim,
@@ -1198,7 +1290,7 @@ class HubState:
                     "last_error": None,
                 }
             )
-            if event:
+            if event and client is not None:
                 hook_state = {
                     "status": "sending",
                     "last_anim": anim,
@@ -1244,6 +1336,17 @@ class HubState:
 
         transport_message = "; ".join(r["message"] for r in results)
         with self.lock:
+            if delivery_epoch != int(self.state.get("system_epoch") or 0):
+                log(
+                    "ignored stale delivery result "
+                    f"client={client_key} epoch={delivery_epoch}"
+                )
+                return {
+                    "ok": sent,
+                    "status": status,
+                    "elapsed_ms": elapsed_ms,
+                    "results": results,
+                }
             for result in results:
                 self.transports[result["transport"]] = {
                     "status": "delivered" if result["ok"] else "failed",
@@ -1260,17 +1363,18 @@ class HubState:
                 }
             )
             self.state["delivered_count" if sent else "failed_count"] += 1
-            client = self.clients.setdefault(client_key, {"hooks": {}})
-            client["status"] = status
-            client["last_anim"] = anim
-            client["last_event"] = event
-            client["last_tool"] = tool
-            client["last_at"] = ts
-            client["delivered_count"] = int(client.get("delivered_count", 0)) + (1 if sent else 0)
-            client["failed_count"] = int(client.get("failed_count", 0)) + (0 if sent else 1)
+            if not is_system:
+                client = self.clients.setdefault(client_key, {"hooks": {}})
+                client["status"] = status
+                client["last_anim"] = anim
+                client["last_event"] = event
+                client["last_tool"] = tool
+                client["last_at"] = ts
+                client["delivered_count"] = int(client.get("delivered_count", 0)) + (1 if sent else 0)
+                client["failed_count"] = int(client.get("failed_count", 0)) + (0 if sent else 1)
             if not sent:
                 self.last_published_fingerprint = None
-            if event:
+            if event and not is_system:
                 self.hooks[hook_key]["status"] = status
                 client.setdefault("hooks", {}).setdefault(event, {})["status"] = status
 
@@ -1685,6 +1789,10 @@ class HubHandler(BaseHTTPRequestHandler):
                 self.send_json(self.hub.deliver(data))
             elif path == "/enqueue":
                 self.send_json(self.hub.enqueue(data))
+            elif path == "/system/state":
+                state = str(data.get("state") or "")
+                reason = str(data.get("reason") or "")
+                self.send_json(self.hub.set_system_power_state(state, reason))
             elif path == "/send":
                 data.setdefault("source", "manual")
                 data.setdefault("client_id", "manual")
@@ -1731,6 +1839,7 @@ def main() -> int:
             log(f"hub bind skipped http://{args.host}:{args.hub_port}: {exc}")
             return 0
         write_pid()
+        HubHandler.hub.set_system_power_state("awake", "startup")
         log(f"hub listening http://{args.host}:{args.hub_port} transport={args.transport}")
         print(f"Clawd Hook Hub: http://{args.host}:{args.hub_port}")
         try:
