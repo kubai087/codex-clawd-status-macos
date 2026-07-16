@@ -5,6 +5,25 @@ import time
 from clawd_status_hub import HubState, LatestDeliveryQueue
 
 
+def hub_args():
+    return argparse.Namespace(
+        ble_name="Claude-Mochi-Tank",
+        ble_address=None,
+        port=None,
+        baud=None,
+        transport="auto",
+    )
+
+
+class CaptureQueue:
+    def __init__(self):
+        self.items = []
+
+    def enqueue(self, delivery):
+        self.items.append(delivery)
+        return None
+
+
 def test_queue_returns_before_delivery_finishes():
     release = threading.Event()
     started = threading.Event()
@@ -104,7 +123,13 @@ def test_hub_enqueue_marks_platform_queued_without_delivery():
         }
     )
 
-    assert result == {"ok": True, "status": "queued"}
+    assert result == {
+        "ok": True,
+        "status": "queued",
+        "client_key": "workbuddy",
+        "display_role": "effective",
+        "display_changed": True,
+    }
     assert captured[0]["client_id"] == "workbuddy"
     state = hub.snapshot()
     assert state["transport_status"] == "queued"
@@ -146,7 +171,7 @@ def test_queue_returns_the_pending_state_it_replaces():
     release.set()
 
 
-def test_hub_marks_replaced_platform_state_superseded():
+def test_hub_coalescing_does_not_erase_masked_platform_state():
     class HoldingQueue:
         def __init__(self):
             self.pending = None
@@ -186,8 +211,120 @@ def test_hub_marks_replaced_platform_state_superseded():
     )
 
     state = hub.snapshot()
-    assert state["clients"]["codebuddy"]["status"] == "superseded"
-    assert state["hooks"]["codebuddy:UserPromptSubmit"]["status"] == (
-        "superseded"
+    assert state["clients"]["codebuddy"]["status"] == "queued"
+    assert state["clients"]["codebuddy"]["display_role"] == "masked"
+    assert state["hooks"]["codebuddy:UserPromptSubmit"]["status"] == "queued"
+    assert state["hooks"]["codebuddy:UserPromptSubmit"]["display_role"] == (
+        "masked"
     )
     assert state["clients"]["workbuddy"]["status"] == "queued"
+    assert state["clients"]["workbuddy"]["display_role"] == "effective"
+    assert any(
+        event["status"] == "coalesced" and event["client_id"] == "codebuddy"
+        for event in hub.recent_events()
+    )
+
+
+def test_lower_priority_event_is_recorded_without_replacing_effective_work():
+    hub = HubState(hub_args())
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+
+    first = hub.enqueue(
+        {
+            "source": "codex",
+            "client_id": "codex-desktop",
+            "client_kind": "codex",
+            "session_id": "A",
+            "anim": "thinking",
+            "event": "UserPromptSubmit",
+        }
+    )
+    second = hub.enqueue(
+        {
+            "source": "codebuddy",
+            "client_id": "codebuddy",
+            "client_kind": "codebuddy",
+            "session_id": "B",
+            "anim": "happy",
+            "event": "Stop",
+        }
+    )
+
+    assert [item["client_key"] for item in queue.items] == ["codex-desktop:A"]
+    assert first["display_changed"] is True
+    assert second["display_changed"] is False
+    assert second["display_role"] == "masked"
+    state = hub.snapshot()
+    assert state["aggregate"]["effective_client_key"] == "codex-desktop:A"
+    assert state["clients"]["codex-desktop:A"]["semantic_status"] == "working"
+    assert state["clients"]["codebuddy:B"]["semantic_status"] == "complete"
+    assert state["clients"]["codebuddy:B"]["display_role"] == "masked"
+
+
+def test_waiting_preempts_working_and_is_the_only_new_physical_command():
+    hub = HubState(hub_args())
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+
+    hub.enqueue(
+        {
+            "source": "codex",
+            "client_id": "codex-desktop",
+            "client_kind": "codex",
+            "session_id": "A",
+            "anim": "thinking",
+        }
+    )
+    result = hub.enqueue(
+        {
+            "source": "workbuddy",
+            "client_id": "workbuddy",
+            "client_kind": "workbuddy",
+            "session_id": "C",
+            "anim": "confused",
+            "event": "PermissionRequest",
+        }
+    )
+
+    assert [item["client_key"] for item in queue.items] == [
+        "codex-desktop:A",
+        "workbuddy:C",
+    ]
+    assert result["display_role"] == "effective"
+    assert hub.snapshot()["current_client_key"] == "workbuddy:C"
+
+
+def test_recompute_after_completion_expiry_restores_working_session():
+    now = [0.0]
+    hub = HubState(hub_args(), clock=lambda: now[0], start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+
+    hub.enqueue(
+        {
+            "source": "codebuddy",
+            "client_id": "codebuddy",
+            "client_kind": "codebuddy",
+            "session_id": "B",
+            "anim": "happy",
+        }
+    )
+    now[0] = 0.1
+    hub.enqueue(
+        {
+            "source": "codex",
+            "client_id": "codex-desktop",
+            "client_kind": "codex",
+            "session_id": "A",
+            "anim": "thinking",
+        }
+    )
+    now[0] = 3.01
+
+    changed = hub.recompute_aggregate(now=now[0])
+
+    assert changed is False
+    assert hub.snapshot()["aggregate"]["effective_client_key"] == (
+        "codex-desktop:A"
+    )

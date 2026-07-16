@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from codex_clawd_status_macos.runtime_command import role_command
+from status_arbiter import Decision, StatusArbiter, client_key as arbiter_client_key
 
 
 LOG_DIR = Path.home() / ".clawd-mochi"
@@ -505,13 +506,32 @@ class LatestDeliveryQueue:
 
 
 class HubState:
-    def __init__(self, args: argparse.Namespace) -> None:
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *,
+        clock=time.time,
+        start_scheduler: bool = True,
+    ) -> None:
         self.args = args
-        self.lock = threading.Lock()
+        self.clock = clock
+        self.lock = threading.RLock()
+        self.arbitration_condition = threading.Condition(self.lock)
         self.events: list[dict[str, Any]] = []
         self.hooks: dict[str, dict[str, Any]] = {}
         self.clients: dict[str, dict[str, Any]] = {}
         self.transports: dict[str, dict[str, Any]] = {}
+        self.arbiter = StatusArbiter(clock=clock)
+        self.last_published_fingerprint: tuple[str | None, str, str] | None = None
+        self.aggregate: dict[str, Any] = {
+            "effective_client_key": None,
+            "effective_status": "idle",
+            "active_count": 0,
+            "waiting_count": 0,
+            "working_count": 0,
+            "error_count": 0,
+            "next_deadline": None,
+        }
         self.status_effects = read_status_effects()
         self.use_status_effects = os.environ.get("CLAWD_TANK_USE_STATUS_EFFECTS", "0").lower() in {"1", "true", "yes", "on"}
         self.state: dict[str, Any] = {
@@ -519,7 +539,9 @@ class HubState:
             "current_anim": None,
             "current_source": None,
             "current_client_id": None,
+            "current_client_key": None,
             "current_client_kind": None,
+            "current_session_id": None,
             "current_event": None,
             "current_tool": None,
             "current_status": None,
@@ -535,6 +557,12 @@ class HubState:
         self.ble = BleSession(args.ble_name, args.ble_address)
         self.serial = SerialSession(args.port, args.baud)
         self.delivery_queue = LatestDeliveryQueue(self.deliver)
+        if start_scheduler:
+            threading.Thread(
+                target=self._arbitration_loop,
+                name="clawd-status-arbiter",
+                daemon=True,
+            ).start()
 
     def scan_serial(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
@@ -769,6 +797,7 @@ class HubState:
         with self.lock:
             return {
                 **self.state,
+                "aggregate": dict(self.aggregate),
                 "status_labels": STATUS_LABELS,
                 "status_effects": self.status_effects,
                 "hooks": self.hooks,
@@ -791,11 +820,20 @@ class HubState:
             serial_port = ""
 
         def client_module(client_id: str, label: str, configured: bool) -> dict[str, Any]:
-            client = self.clients.get(client_id, {})
+            matches = [
+                item
+                for item in self.clients.values()
+                if item.get("client_id") == client_id
+            ]
+            client = max(matches, key=lambda item: item.get("last_at") or 0, default={})
             last_at = client.get("last_at")
             if client:
                 status = client.get("status") or "seen"
-                detail = f"last {client.get('last_anim') or ''} {fmt_age(last_at)}".strip()
+                sessions = f"{len(matches)} session" + ("s" if len(matches) != 1 else "")
+                detail = (
+                    f"{sessions}; last {client.get('last_anim') or ''} "
+                    f"{fmt_age(last_at)}"
+                ).strip()
             else:
                 status = "configured" if configured else "missing"
                 detail = "waiting for first event" if configured else "hook config not found"
@@ -877,6 +915,134 @@ class HubState:
             if len(self.events) > EVENTS_LIMIT:
                 del self.events[: len(self.events) - EVENTS_LIMIT]
 
+    def _arbitration_loop(self) -> None:
+        while True:
+            with self.arbitration_condition:
+                now = self.clock()
+                deadline = self.arbiter.next_deadline(now)
+                if deadline is None:
+                    self.arbitration_condition.wait()
+                    continue
+                notified = self.arbitration_condition.wait(
+                    timeout=max(0.0, deadline - now)
+                )
+                if notified:
+                    continue
+                self._recompute_aggregate_locked(self.clock())
+
+    def recompute_aggregate(self, now: float | None = None) -> bool:
+        with self.arbitration_condition:
+            return self._recompute_aggregate_locked(
+                self.clock() if now is None else float(now)
+            )
+
+    def _recompute_aggregate_locked(self, now: float) -> bool:
+        decision = self.arbiter.evaluate(now)
+        changed = self._publish_decision_locked(decision, now)
+        self.arbitration_condition.notify_all()
+        return changed
+
+    def _sync_arbiter_clients_locked(self) -> None:
+        for key, arbiter_state in self.arbiter.clients.items():
+            client = self.clients.setdefault(
+                key,
+                {
+                    "client_key": key,
+                    "client_id": arbiter_state.client_id,
+                    "kind": arbiter_state.client_kind,
+                    "source": arbiter_state.source,
+                    "session_id": arbiter_state.session_id,
+                    "status": "seen",
+                    "hooks": {},
+                    "delivered_count": 0,
+                    "failed_count": 0,
+                },
+            )
+            client.update(
+                {
+                    "client_key": key,
+                    "client_id": arbiter_state.client_id,
+                    "kind": arbiter_state.client_kind,
+                    "source": arbiter_state.source,
+                    "session_id": arbiter_state.session_id,
+                    "semantic_status": arbiter_state.semantic_status,
+                    "display_role": arbiter_state.display_role,
+                    "last_anim": arbiter_state.anim,
+                    "last_event": arbiter_state.event,
+                    "last_tool": arbiter_state.tool,
+                    "last_at": arbiter_state.updated_at,
+                    "phase_deadline": arbiter_state.phase_deadline,
+                    "stale_at": arbiter_state.stale_at,
+                }
+            )
+            for hook_state in client.get("hooks", {}).values():
+                hook_state["display_role"] = arbiter_state.display_role
+            for hook_state in self.hooks.values():
+                if hook_state.get("last_client_key") == key:
+                    hook_state["display_role"] = arbiter_state.display_role
+
+    def _publish_decision_locked(self, decision: Decision, now: float) -> bool:
+        self._sync_arbiter_clients_locked()
+        arbiter_snapshot = self.arbiter.snapshot(now)
+        self.aggregate = dict(arbiter_snapshot["aggregate"])
+        delivery = dict(decision.delivery)
+        fingerprint = (decision.client_key, decision.status, decision.anim)
+        changed = fingerprint != self.last_published_fingerprint
+
+        self.state.update(
+            {
+                "current_anim": decision.anim,
+                "current_source": delivery.get("source"),
+                "current_client_id": decision.client_id,
+                "current_client_key": decision.client_key,
+                "current_client_kind": delivery.get("client_kind"),
+                "current_session_id": decision.session_id,
+                "current_event": delivery.get("event") or "",
+                "current_tool": delivery.get("tool") or "",
+                "current_status": decision.status,
+                "last_hook_at": now,
+                "last_error": None,
+            }
+        )
+        if not changed:
+            return False
+
+        replaced = self.delivery_queue.enqueue(delivery)
+        if replaced is not None:
+            self._record_coalesced_locked(replaced, now)
+        self.last_published_fingerprint = fingerprint
+        self.state["transport_status"] = "queued"
+        return True
+
+    def _record_coalesced_locked(
+        self, delivery: dict[str, Any], timestamp: float
+    ) -> None:
+        self.events.append(
+            {
+                "at": now_iso(),
+                "source": str(delivery.get("source") or "manual"),
+                "client_id": str(delivery.get("client_id") or "manual"),
+                "client_key": str(
+                    delivery.get("client_key") or arbiter_client_key(delivery)
+                ),
+                "session_id": str(delivery.get("session_id") or ""),
+                "client_kind": str(delivery.get("client_kind") or "manual"),
+                "event": str(delivery.get("event") or ""),
+                "tool": str(delivery.get("tool") or ""),
+                "anim": str(delivery.get("anim") or "custom"),
+                "semantic_status": str(
+                    delivery.get("status")
+                    or status_for_anim(str(delivery.get("anim") or ""))
+                ),
+                "status": "coalesced",
+                "elapsed_ms": 0,
+                "results": [],
+                "last_at": timestamp,
+            }
+        )
+        if len(self.events) > EVENTS_LIMIT:
+            del self.events[: len(self.events) - EVENTS_LIMIT]
+
     def enqueue(self, delivery: dict[str, Any]) -> dict[str, Any]:
         command = self.device_command(delivery)
         if not command.get("anim") and not any(
@@ -887,30 +1053,47 @@ class HubState:
         source = str(delivery.get("source") or "manual")
         client_id = str(delivery.get("client_id") or source)
         client_kind = str(delivery.get("client_kind") or source)
+        session_id = str(delivery.get("session_id") or "")
         event = str(delivery.get("event") or "")
         tool = str(delivery.get("tool") or "")
         anim = str(delivery.get("anim") or "custom")
-        timestamp = time.time()
-        hook_key = f"{client_id}:{event}" if event else client_id
+        timestamp = self.clock()
+        semantic_status = str(delivery.get("status") or status_for_anim(anim))
+        normalized = {
+            **delivery,
+            "source": source,
+            "client_id": client_id,
+            "client_kind": client_kind,
+            "session_id": session_id,
+            "status": semantic_status,
+            "anim": anim,
+            "event": event,
+            "tool": tool,
+        }
+        key = arbiter_client_key(normalized)
+        hook_key = f"{key}:{event}" if event else key
         hook_state = {
             "status": "queued",
+            "semantic_status": semantic_status,
             "last_anim": anim,
             "last_tool": tool,
             "last_source": source,
             "last_client_id": client_id,
+            "last_client_key": key,
+            "last_session_id": session_id,
             "last_client_kind": client_kind,
             "last_at": timestamp,
         }
-        with self.lock:
-            superseded = self.delivery_queue.enqueue(delivery)
-            if superseded is not None:
-                self._mark_superseded_locked(superseded, timestamp)
+        with self.arbitration_condition:
+            decision = self.arbiter.update(normalized, now=timestamp)
             client = self.clients.setdefault(
-                client_id,
+                key,
                 {
+                    "client_key": key,
                     "client_id": client_id,
                     "kind": client_kind,
                     "source": source,
+                    "session_id": session_id,
                     "hooks": {},
                     "delivered_count": 0,
                     "failed_count": 0,
@@ -921,6 +1104,7 @@ class HubState:
                     "kind": client_kind,
                     "source": source,
                     "status": "queued",
+                    "semantic_status": semantic_status,
                     "last_at": timestamp,
                     "last_anim": anim,
                     "last_event": event,
@@ -930,70 +1114,30 @@ class HubState:
             if event:
                 self.hooks[hook_key] = {"event": event, **hook_state}
                 client.setdefault("hooks", {})[event] = hook_state
-            self.state.update(
-                {
-                    "current_anim": anim,
-                    "current_source": source,
-                    "current_client_id": client_id,
-                    "current_client_kind": client_kind,
-                    "current_event": event,
-                    "current_tool": tool,
-                    "current_status": status_for_anim(anim),
-                    "transport_status": "queued",
-                    "last_hook_at": timestamp,
-                    "last_error": None,
-                }
-            )
-        return {"ok": True, "status": "queued"}
-
-    def _mark_superseded_locked(
-        self, delivery: dict[str, Any], timestamp: float
-    ) -> None:
-        source = str(delivery.get("source") or "manual")
-        client_id = str(delivery.get("client_id") or source)
-        client_kind = str(delivery.get("client_kind") or source)
-        event = str(delivery.get("event") or "")
-        tool = str(delivery.get("tool") or "")
-        anim = str(delivery.get("anim") or "custom")
-        hook_key = f"{client_id}:{event}" if event else client_id
-        client = self.clients.get(client_id)
-        if client is not None:
-            client.update(
-                {
-                    "status": "superseded",
-                    "last_at": timestamp,
-                    "last_anim": anim,
-                    "last_event": event,
-                    "last_tool": tool,
-                }
-            )
-            if event in client.get("hooks", {}):
-                client["hooks"][event]["status"] = "superseded"
-        if hook_key in self.hooks:
-            self.hooks[hook_key]["status"] = "superseded"
-        self.events.append(
-            {
-                "at": now_iso(),
-                "source": source,
-                "client_id": client_id,
-                "client_kind": client_kind,
-                "event": event,
-                "tool": tool,
-                "anim": anim,
-                "semantic_status": status_for_anim(anim),
-                "status": "superseded",
-                "elapsed_ms": 0,
-                "results": [],
-            }
-        )
-        if len(self.events) > EVENTS_LIMIT:
-            del self.events[: len(self.events) - EVENTS_LIMIT]
+            display_changed = self._publish_decision_locked(decision, timestamp)
+            self._sync_arbiter_clients_locked()
+            display_role = self.clients[key]["display_role"]
+            if event:
+                self.hooks[hook_key]["display_role"] = display_role
+                client.setdefault("hooks", {})[event]["display_role"] = display_role
+            self.arbitration_condition.notify_all()
+        return {
+            "ok": True,
+            "status": "queued",
+            "client_key": key,
+            "display_role": display_role,
+            "display_changed": display_changed,
+        }
 
     def deliver(self, delivery: dict[str, Any]) -> dict[str, Any]:
         payload = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
         source = str(delivery.get("source") or "manual")
         client_id = str(delivery.get("client_id") or source or "manual")
         client_kind = str(delivery.get("client_kind") or source or "manual")
+        session_id = str(delivery.get("session_id") or "")
+        client_key = str(
+            delivery.get("client_key") or arbiter_client_key(delivery)
+        )
         event = str(delivery.get("event") or payload.get("hook_event_name") or payload.get("event") or "")
         tool = str(delivery.get("tool") or payload.get("tool_name") or payload.get("toolName") or "")
 
@@ -1019,15 +1163,17 @@ class HubState:
             return {"ok": False, "error": "missing anim or effect"}
 
         ts = time.time()
-        hook_key = f"{client_id}:{event}" if event else client_id
+        hook_key = f"{client_key}:{event}" if event else client_key
 
         with self.lock:
             client = self.clients.setdefault(
-                client_id,
+                client_key,
                 {
+                    "client_key": client_key,
                     "client_id": client_id,
                     "kind": client_kind,
                     "source": source,
+                    "session_id": session_id,
                     "status": "idle",
                     "hooks": {},
                     "delivered_count": 0,
@@ -1041,7 +1187,9 @@ class HubState:
                     "current_anim": anim,
                     "current_source": source,
                     "current_client_id": client_id,
+                    "current_client_key": client_key,
                     "current_client_kind": client_kind,
+                    "current_session_id": session_id,
                     "current_event": event,
                     "current_tool": tool,
                     "current_status": semantic_status,
@@ -1080,6 +1228,8 @@ class HubState:
             "at": now_iso(),
             "source": source,
             "client_id": client_id,
+            "client_key": client_key,
+            "session_id": session_id,
             "client_kind": client_kind,
             "event": event,
             "tool": tool,
@@ -1110,7 +1260,7 @@ class HubState:
                 }
             )
             self.state["delivered_count" if sent else "failed_count"] += 1
-            client = self.clients.setdefault(client_id, {"hooks": {}})
+            client = self.clients.setdefault(client_key, {"hooks": {}})
             client["status"] = status
             client["last_anim"] = anim
             client["last_event"] = event
@@ -1118,11 +1268,13 @@ class HubState:
             client["last_at"] = ts
             client["delivered_count"] = int(client.get("delivered_count", 0)) + (1 if sent else 0)
             client["failed_count"] = int(client.get("failed_count", 0)) + (0 if sent else 1)
+            if not sent:
+                self.last_published_fingerprint = None
             if event:
                 self.hooks[hook_key]["status"] = status
                 client.setdefault("hooks", {}).setdefault(event, {})["status"] = status
 
-        log(f"{status} client={client_id} source={source} event={event!r} tool={tool!r} anim={anim} results={results}")
+        log(f"{status} client={client_key} source={source} event={event!r} tool={tool!r} anim={anim} results={results}")
         return {"ok": sent, "status": status, "elapsed_ms": elapsed_ms, "results": results}
 
     def device_command(self, delivery: dict[str, Any]) -> dict[str, Any]:
