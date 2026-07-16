@@ -32,6 +32,21 @@ The bundled skill is linked into each platform's user-level skill directory.
 All platforms share one LaunchAgent, Hub, self-contained runtime, and ESP32
 transport. Uninstalled platforms remain dormant and work when installed later.
 
+## Concurrent tasks
+
+The Hub tracks each IDE session independently and sends only one aggregate
+state to the ESP32. A task that completes or sleeps cannot hide another task
+that is still working or waiting for confirmation. The display priority is:
+
+```text
+waiting > error > working > waiting connection > complete > idle > sleeping
+```
+
+Completion holds for three seconds, error holds for ten seconds, and only then
+yields to another active session. Codex Desktop and VS Code session logs are
+tailed concurrently by the same supervised watcher. BLE and USB writes remain
+serialized through one delivery worker.
+
 Existing settings and unrelated hooks are preserved. The installer safely
 migrates the earlier Python/venv CodeBuddy and WorkBuddy hook when present.
 

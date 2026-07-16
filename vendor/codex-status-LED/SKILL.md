@@ -21,8 +21,15 @@ transport result; a running process alone does not prove device delivery.
 | WorkBuddy | `~/.workbuddy/settings.json` | `workbuddy` |
 
 The shared Hub listens only on `http://127.0.0.1:8765`. Normal lifecycle
-events use `/enqueue`; the Hub coalesces rapid events and owns BLE-to-serial
-fallback. Platform hooks must exit zero and must never wait for device I/O.
+events use `/enqueue`; the Hub tracks platform sessions independently,
+arbitrates one aggregate state, coalesces only physical display updates, and
+owns BLE-to-serial fallback. Platform hooks must exit zero and must never wait
+for device I/O.
+
+Aggregate priority is `waiting > error > working > waiting_connection >
+complete > idle > sleeping`. A completed or sleeping session cannot hide
+another session that is still working. Codex Desktop and VS Code session logs
+are tailed concurrently by the one supervised watcher.
 
 ## Quick Reference
 
@@ -65,6 +72,8 @@ successful USB serial fallback is valid.
 ## Common Mistakes
 
 - Do not start separate Hubs for different platforms; port 8765 has one owner.
+- Do not interpret one session's completion as global completion; inspect the
+  `/state` aggregate and client table.
 - Do not install Python, Homebrew, or a virtual environment; the release is
   self-contained.
 - Do not hard-code a USB device path; serial discovery is intentional.
