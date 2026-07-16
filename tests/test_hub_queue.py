@@ -125,3 +125,69 @@ def test_hub_enqueue_rejects_missing_display_command():
         "ok": False,
         "error": "missing anim or effect",
     }
+
+
+def test_queue_returns_the_pending_state_it_replaces():
+    release = threading.Event()
+    started = threading.Event()
+
+    def deliver(_item):
+        started.set()
+        release.wait(1)
+
+    queue = LatestDeliveryQueue(deliver)
+    assert queue.enqueue({"client_id": "in-flight", "anim": "building"}) is None
+    assert started.wait(1)
+    assert queue.enqueue({"client_id": "old", "anim": "thinking"}) is None
+
+    replaced = queue.enqueue({"client_id": "new", "anim": "happy"})
+
+    assert replaced == {"client_id": "old", "anim": "thinking"}
+    release.set()
+
+
+def test_hub_marks_replaced_platform_state_superseded():
+    class HoldingQueue:
+        def __init__(self):
+            self.pending = None
+
+        def enqueue(self, delivery):
+            replaced = self.pending
+            self.pending = delivery
+            return replaced
+
+    args = argparse.Namespace(
+        ble_name="Claude-Mochi-Tank",
+        ble_address=None,
+        port=None,
+        baud=None,
+        transport="auto",
+    )
+    hub = HubState(args)
+    hub.delivery_queue = HoldingQueue()
+    hub.enqueue(
+        {
+            "source": "codebuddy",
+            "client_id": "codebuddy",
+            "client_kind": "codebuddy",
+            "anim": "thinking",
+            "event": "UserPromptSubmit",
+        }
+    )
+
+    hub.enqueue(
+        {
+            "source": "workbuddy",
+            "client_id": "workbuddy",
+            "client_kind": "workbuddy",
+            "anim": "confused",
+            "event": "PermissionRequest",
+        }
+    )
+
+    state = hub.snapshot()
+    assert state["clients"]["codebuddy"]["status"] == "superseded"
+    assert state["hooks"]["codebuddy:UserPromptSubmit"]["status"] == (
+        "superseded"
+    )
+    assert state["clients"]["workbuddy"]["status"] == "queued"

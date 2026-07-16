@@ -484,10 +484,12 @@ class LatestDeliveryQueue:
         self.pending: dict[str, Any] | None = None
         threading.Thread(target=self._run, daemon=True).start()
 
-    def enqueue(self, delivery: dict[str, Any]) -> None:
+    def enqueue(self, delivery: dict[str, Any]) -> dict[str, Any] | None:
         with self.condition:
+            replaced = self.pending
             self.pending = dict(delivery)
             self.condition.notify()
+            return replaced
 
     def _run(self) -> None:
         while True:
@@ -900,6 +902,9 @@ class HubState:
             "last_at": timestamp,
         }
         with self.lock:
+            superseded = self.delivery_queue.enqueue(delivery)
+            if superseded is not None:
+                self._mark_superseded_locked(superseded, timestamp)
             client = self.clients.setdefault(
                 client_id,
                 {
@@ -939,8 +944,50 @@ class HubState:
                     "last_error": None,
                 }
             )
-        self.delivery_queue.enqueue(delivery)
         return {"ok": True, "status": "queued"}
+
+    def _mark_superseded_locked(
+        self, delivery: dict[str, Any], timestamp: float
+    ) -> None:
+        source = str(delivery.get("source") or "manual")
+        client_id = str(delivery.get("client_id") or source)
+        client_kind = str(delivery.get("client_kind") or source)
+        event = str(delivery.get("event") or "")
+        tool = str(delivery.get("tool") or "")
+        anim = str(delivery.get("anim") or "custom")
+        hook_key = f"{client_id}:{event}" if event else client_id
+        client = self.clients.get(client_id)
+        if client is not None:
+            client.update(
+                {
+                    "status": "superseded",
+                    "last_at": timestamp,
+                    "last_anim": anim,
+                    "last_event": event,
+                    "last_tool": tool,
+                }
+            )
+            if event in client.get("hooks", {}):
+                client["hooks"][event]["status"] = "superseded"
+        if hook_key in self.hooks:
+            self.hooks[hook_key]["status"] = "superseded"
+        self.events.append(
+            {
+                "at": now_iso(),
+                "source": source,
+                "client_id": client_id,
+                "client_kind": client_kind,
+                "event": event,
+                "tool": tool,
+                "anim": anim,
+                "semantic_status": status_for_anim(anim),
+                "status": "superseded",
+                "elapsed_ms": 0,
+                "results": [],
+            }
+        )
+        if len(self.events) > EVENTS_LIMIT:
+            del self.events[: len(self.events) - EVENTS_LIMIT]
 
     def deliver(self, delivery: dict[str, Any]) -> dict[str, Any]:
         payload = delivery.get("payload") if isinstance(delivery.get("payload"), dict) else {}
