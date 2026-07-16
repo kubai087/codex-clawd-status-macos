@@ -328,33 +328,33 @@ def ping_hub(cli_url: str | None = None) -> bool:
 
 
 def send_anim_hub(anim: str, args: argparse.Namespace, payload: dict | None = None, event_time: float | None = None) -> bool:
-    ensure_hub(args)
     event = payload.get("hook_event_name") or payload.get("event") if payload else ""
     tool = payload.get("tool_name") or payload.get("toolName") if payload else ""
+    source = str(getattr(args, "source", "codex"))
+    kind = str(getattr(args, "client_kind", source))
     body = json.dumps(
         {
-            "source": "codex",
+            "source": source,
             "client_id": client_id(getattr(args, "client_id", None)),
-            "client_kind": "codex",
+            "client_kind": kind,
             "anim": anim,
             "event": event,
             "tool": tool,
-            "payload": payload or {},
             "event_time": event_time,
         },
         separators=(",", ":"),
     ).encode("utf-8")
     req = urllib.request.Request(
-        hub_url(args.hub_url) + "/hook",
+        hub_url(args.hub_url) + "/enqueue",
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
     try:
-        with hub_urlopen(req, timeout=5.0) as resp:
+        with hub_urlopen(req, timeout=1.0) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             ok = bool(data.get("ok"))
-            log(f"hub delivery anim={anim} ok={ok} status={data.get('status')}")
+            log(f"hub enqueue anim={anim} ok={ok} status={data.get('status')}")
             return ok
     except Exception as exc:
         log(f"hub delivery failed anim={anim}: {exc}")
@@ -681,7 +681,10 @@ def spawn_timed_transition(event_time: float, args: argparse.Namespace) -> None:
         transition_args += ["--ble-address", args.ble_address]
     if args.ble_name:
         transition_args += ["--ble-name", args.ble_name]
-    cmd = role_command("hook", transition_args)
+    role = str(getattr(args, "transition_role", "hook"))
+    if role == "buddy-hook":
+        transition_args += ["--platform", str(args.platform)]
+    cmd = role_command(role, transition_args)
 
     kwargs: dict = {
         "stdout": subprocess.DEVNULL,
@@ -700,7 +703,9 @@ def spawn_timed_transition(event_time: float, args: argparse.Namespace) -> None:
 
 
 def run_timed_transition(event_time: float, transport: str | None, port: str | None,
-                         baud: int | None, ble_address: str | None, ble_name: str | None) -> None:
+                         baud: int | None, ble_address: str | None, ble_name: str | None,
+                         source: str = "codex", client_kind: str = "codex",
+                         client_id_value: str = DEFAULT_CLIENT_ID) -> None:
     """Background: wait after completion, then idle, then sleeping."""
     args = argparse.Namespace(
         transport=transport,
@@ -711,7 +716,9 @@ def run_timed_transition(event_time: float, transport: str | None, port: str | N
         hub_url=None,
         no_hub=False,
         hub_required=False,
-        client_id=DEFAULT_CLIENT_ID,
+        client_id=client_id_value,
+        source=source,
+        client_kind=client_kind,
     )
 
     time.sleep(COMPLETE_DURATION_S)
@@ -848,6 +855,9 @@ def main() -> int:
     parser.add_argument("--timed-transition", type=float, default=None, metavar="EPOCH",
                         help="internal: run complete->idle->sleeping timer started at EPOCH")
     args = parser.parse_args()
+    args.source = "codex"
+    args.client_kind = "codex"
+    args.transition_role = "hook"
 
     if args.doctor:
         return doctor()
@@ -873,8 +883,6 @@ def main() -> int:
     payload = read_payload()
     if payload is None:
         return 0
-
-    ensure_session_watcher(args)
 
     # Update activity timestamp so timed transitions can detect new events
     event_time = touch_last_event()

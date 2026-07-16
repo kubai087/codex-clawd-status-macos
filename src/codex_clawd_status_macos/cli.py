@@ -14,6 +14,7 @@ ROLES = {
     "hub": "clawd_status_hub",
     "watch": "codex_session_watch",
     "hook": "codex_clawd_hook",
+    "buddy-hook": "buddy_clawd_hook",
 }
 
 
