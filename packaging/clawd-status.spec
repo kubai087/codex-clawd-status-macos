@@ -17,6 +17,7 @@ a = Analysis(
         "clawd_status_hub",
         "codex_session_watch",
         "codex_clawd_hook",
+        "buddy_clawd_hook",
         *bleak_hidden,
         *serial_hidden,
     ],
