@@ -50,6 +50,19 @@ serialized through one delivery worker.
 Existing settings and unrelated hooks are preserved. The installer safely
 migrates the earlier Python/venv CodeBuddy and WorkBuddy hook when present.
 
+## Mac sleep, wake, and restart
+
+macOS power state overrides every task priority. Before normal system sleep,
+the supervisor clears all task sessions and sends `sleeping` (`leds: 000`).
+Task events received during sleep are acknowledged but discarded. After wake,
+login, service restart, or Hub restart, the runtime starts from `idle`; it never
+restores task state captured before sleep.
+
+This behavior covers normal macOS sleep and graceful shutdown. If the Mac loses
+power abruptly while the ESP32 has an independent power source, the Mac cannot
+send a final command. A firmware watchdog that turns the LEDs off after host
+heartbeats stop is required for an absolute stale-light guarantee in that case.
+
 ## Manage
 
 ```bash

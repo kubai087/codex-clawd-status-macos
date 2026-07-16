@@ -31,6 +31,19 @@ complete > idle > sleeping`. A completed or sleeping session cannot hide
 another session that is still working. Codex Desktop and VS Code session logs
 are tailed concurrently by the one supervised watcher.
 
+## System Power Semantics
+
+macOS sleep is a hard override above aggregate task priority. On a normal
+system-will-sleep notification, the Hub clears all sessions and sends
+`sleeping` (`leds: 000`). While that override is active, lifecycle events are
+acknowledged as `system-masked` and are not retained. Wake, login, supervisor
+restart, and Hub restart publish `idle` with an empty client table; do not try
+to restore pre-sleep tasks.
+
+An abrupt Mac power loss cannot send a final command. If the ESP32 is powered
+independently, only a firmware watchdog that clears the LEDs after host
+heartbeats stop can guarantee that stale state is removed.
+
 ## Quick Reference
 
 ```bash
@@ -74,6 +87,7 @@ successful USB serial fallback is valid.
 - Do not start separate Hubs for different platforms; port 8765 has one owner.
 - Do not interpret one session's completion as global completion; inspect the
   `/state` aggregate and client table.
+- Do not restore client state after wake; the system power reset is intentional.
 - Do not install Python, Homebrew, or a virtual environment; the release is
   self-contained.
 - Do not hard-code a USB device path; serial discovery is intentional.
