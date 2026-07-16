@@ -10,12 +10,13 @@ mapping and transport code as a fallback live bridge.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import json
 import os
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 try:
     import codex_clawd_hook as hook
@@ -29,6 +30,29 @@ WATCH_PID_PATH = hook.LOG_DIR / "session-watch.pid"
 WATCH_RUN_LOCK_PATH = hook.LOG_DIR / "session-watch.run.lock"
 
 
+@dataclass(frozen=True)
+class SessionIdentity:
+    client_id: str
+    session_id: str
+
+
+@dataclass
+class TrackedSession:
+    path: Path
+    identity: SessionIdentity
+    offset: int
+    mtime: float
+    last_activity: float
+    handle: TextIO | None = None
+
+
+@dataclass(frozen=True)
+class WatchedEvent:
+    identity: SessionIdentity
+    anim: str
+    reason: str
+
+
 def originator_client_id(originator: str, source: str, fallback: str) -> str:
     text = f"{originator} {source}".lower()
     if "desktop" in text:
@@ -39,19 +63,140 @@ def originator_client_id(originator: str, source: str, fallback: str) -> str:
 
 
 def session_client_id(path: Path, fallback: str) -> str:
+    return session_identity(path, fallback).client_id
+
+
+def session_identity(path: Path, fallback: str) -> SessionIdentity:
     try:
         first = path.open("r", encoding="utf-8", errors="replace").readline()
         item = json.loads(first)
     except (OSError, json.JSONDecodeError):
-        return fallback
+        return SessionIdentity(fallback, path.stem)
     if not isinstance(item, dict) or item.get("type") != "session_meta":
-        return fallback
+        return SessionIdentity(fallback, path.stem)
     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
-    return originator_client_id(
-        str(payload.get("originator") or ""),
-        str(payload.get("source") or ""),
-        fallback,
+    return SessionIdentity(
+        originator_client_id(
+            str(payload.get("originator") or ""),
+            str(payload.get("source") or ""),
+            fallback,
+        ),
+        str(payload.get("id") or path.stem),
     )
+
+
+def path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def recent_session_files(
+    root: Path,
+    *,
+    now: float | None = None,
+    horizon: float = 24.0 * 60.0 * 60.0,
+) -> list[Path]:
+    timestamp = time.time() if now is None else float(now)
+    try:
+        files = [
+            path
+            for path in root.rglob("*.jsonl")
+            if path.is_file() and path_mtime(path) >= timestamp - horizon
+        ]
+    except OSError:
+        return []
+    return sorted(files)
+
+
+class SessionTracker:
+    def __init__(self, *, replay: bool = False, fallback: str = "codex-watch") -> None:
+        self.replay = replay
+        self.fallback = fallback
+        self.sessions: dict[Path, TrackedSession] = {}
+
+    def discover(self, paths: list[Path], *, now: float | None = None) -> None:
+        timestamp = time.time() if now is None else float(now)
+        self.remove_deleted()
+        for path in sorted(set(paths)):
+            try:
+                size = path.stat().st_size
+            except OSError:
+                continue
+            mtime = path_mtime(path)
+            tracked = self.sessions.get(path)
+            if tracked is None:
+                self.sessions[path] = TrackedSession(
+                    path=path,
+                    identity=session_identity(path, self.fallback),
+                    offset=0 if self.replay else size,
+                    mtime=mtime,
+                    last_activity=timestamp,
+                )
+            elif mtime > tracked.mtime:
+                tracked.mtime = mtime
+
+    def read_available(self, *, now: float | None = None) -> list[WatchedEvent]:
+        timestamp = time.time() if now is None else float(now)
+        events: list[WatchedEvent] = []
+        for path, tracked in list(sorted(self.sessions.items())):
+            if not path.exists():
+                self._remove(path)
+                continue
+            try:
+                if tracked.handle is None:
+                    tracked.handle = path.open(
+                        "r", encoding="utf-8", errors="replace"
+                    )
+                    tracked.handle.seek(tracked.offset)
+                while True:
+                    line = tracked.handle.readline()
+                    if not line:
+                        break
+                    tracked.offset = tracked.handle.tell()
+                    tracked.last_activity = timestamp
+                    tracked.mtime = path_mtime(path)
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(item, dict):
+                        continue
+                    anim, reason = item_to_anim(item)
+                    if anim:
+                        events.append(WatchedEvent(tracked.identity, anim, reason))
+            except OSError:
+                self._close(tracked)
+        return events
+
+    def close_inactive(self, *, now: float, inactive_seconds: float) -> None:
+        for tracked in self.sessions.values():
+            if now - tracked.last_activity >= inactive_seconds:
+                self._close(tracked)
+
+    def remove_deleted(self) -> None:
+        for path in list(self.sessions):
+            if not path.exists():
+                self._remove(path)
+
+    def close(self) -> None:
+        for tracked in self.sessions.values():
+            self._close(tracked)
+
+    def _remove(self, path: Path) -> None:
+        tracked = self.sessions.pop(path, None)
+        if tracked is not None:
+            self._close(tracked)
+
+    @staticmethod
+    def _close(tracked: TrackedSession) -> None:
+        if tracked.handle is not None:
+            try:
+                tracked.handle.close()
+            except OSError:
+                pass
+            tracked.handle = None
 
 
 def latest_session_file() -> Path | None:
@@ -118,17 +263,32 @@ def item_to_anim(item: dict[str, Any]) -> tuple[str | None, str]:
 def send_watched_anim(anim: str, reason: str, args: argparse.Namespace) -> None:
     event_time = hook.touch_last_event()
     hook.log(f"watch mapped {reason} anim={anim}")
-    payload = {"hook_event_name": "SessionWatch", "tool_name": reason}
-    hook.deliver_anim(anim, args, payload=payload, event_time=event_time)
-    if anim == hook.TASK_COMPLETE_ANIM:
+    payload = {
+        "hook_event_name": "SessionWatch",
+        "tool_name": reason,
+        "session_id": str(getattr(args, "session_id", "")),
+    }
+    delivery_mode = hook.deliver_anim(
+        anim, args, payload=payload, event_time=event_time
+    )
+    if anim == hook.TASK_COMPLETE_ANIM and delivery_mode == "direct":
         hook.spawn_timed_transition(event_time, args)
 
 
-def follow_file(path: Path, args: argparse.Namespace) -> None:
+def args_for(
+    identity: SessionIdentity, args: argparse.Namespace
+) -> argparse.Namespace:
     session_args = argparse.Namespace(**vars(args))
-    session_args.client_id = session_client_id(path, args.client_id)
+    session_args.client_id = identity.client_id
     session_args.source = "codex"
     session_args.client_kind = "codex"
+    session_args.session_id = identity.session_id
+    return session_args
+
+
+def follow_file(path: Path, args: argparse.Namespace) -> None:
+    identity = session_identity(path, args.client_id)
+    session_args = args_for(identity, args)
     hook.log(f"watch following session={path} client_id={session_args.client_id}")
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         if not args.replay:
@@ -153,6 +313,34 @@ def follow_file(path: Path, args: argparse.Namespace) -> None:
             anim, reason = item_to_anim(item)
             if anim:
                 send_watched_anim(anim, reason, session_args)
+
+
+def watch_sessions(args: argparse.Namespace) -> None:
+    tracker = SessionTracker(replay=args.replay, fallback=args.client_id)
+    next_scan = 0.0
+    try:
+        while True:
+            now = time.time()
+            if args.session:
+                tracker.discover([args.session], now=now)
+            elif now >= next_scan:
+                tracker.discover(
+                    recent_session_files(SESSIONS_DIR, now=now),
+                    now=now,
+                )
+                next_scan = now + 1.0
+
+            for watched in tracker.read_available(now=now):
+                session_args = args_for(watched.identity, args)
+                send_watched_anim(
+                    watched.anim,
+                    watched.reason,
+                    session_args,
+                )
+            tracker.close_inactive(now=now, inactive_seconds=15.0 * 60.0)
+            time.sleep(args.poll)
+    finally:
+        tracker.close()
 
 
 def write_pid() -> None:
@@ -219,14 +407,8 @@ def main() -> int:
         write_pid()
         hook.log("watch started")
 
-        while True:
-            session = args.session or latest_session_file()
-            if not session:
-                time.sleep(args.poll)
-                continue
-            follow_file(session, args)
-            if args.session:
-                return 0
+        watch_sessions(args)
+        return 0
     finally:
         release_run_lock(WATCH_RUN_LOCK_PATH)
 

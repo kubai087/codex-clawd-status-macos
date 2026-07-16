@@ -1,7 +1,9 @@
 # Clawd Status Integration
 
 This bundled integration maps Codex, CodeBuddy, and WorkBuddy lifecycle events
-to a Clawd/Mochi ESP32 status display.
+to a Clawd/Mochi ESP32 status display. Concurrent sessions are tracked
+independently and reduced to one priority-based aggregate state before any BLE
+or USB write.
 
 ## Architecture
 
@@ -24,7 +26,8 @@ installed user-level skill; users do not need Python or a virtual environment.
 - Hub: `http://127.0.0.1:8765`
 
 Normal platform events are submitted to `/enqueue` so ESP32 connection time
-cannot block an agent. `/send` remains synchronous for device verification.
+cannot block an agent. The Hub prevents one session's completion from hiding
+another active session. `/send` remains synchronous for device verification.
 
 ## Runtime files
 
@@ -32,6 +35,7 @@ cannot block an agent. `/send` remains synchronous for device verification.
 scripts/codex_clawd_hook.py    Codex lifecycle mapping
 scripts/buddy_clawd_hook.py    CodeBuddy and WorkBuddy lifecycle mapping
 scripts/codex_session_watch.py Codex Desktop and VS Code session watcher
+scripts/status_arbiter.py      per-session priority and expiry policy
 scripts/clawd_status_hub.py    queue, dashboard, and ESP32 transport owner
 SKILL.md                       installed maintenance and diagnostic guide
 ```

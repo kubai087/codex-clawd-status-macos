@@ -39,6 +39,14 @@ WATCH_START_LOCK_PATH = LOG_DIR / "session-watch.start.lock"
 HUB_START_LOCK_PATH = LOG_DIR / "status-hub.start.lock"
 DEFAULT_HUB_URL = "http://127.0.0.1:8765"
 DEFAULT_CLIENT_ID = "codex-code"
+SESSION_ID_FIELDS = (
+    "session_id",
+    "sessionId",
+    "conversation_id",
+    "conversationId",
+    "thread_id",
+    "threadId",
+)
 NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 SERIAL_LOCK = threading.Lock()
 
@@ -245,6 +253,19 @@ def client_id(cli_client_id: str | None = None) -> str:
     return (cli_client_id or os.environ.get("CLAWD_TANK_CLIENT_ID") or DEFAULT_CLIENT_ID).strip()
 
 
+def payload_session_id(payload: dict | None) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    for key in SESSION_ID_FIELDS:
+        value = str(payload.get(key) or "").strip()
+        if value:
+            return value
+    transcript = str(
+        payload.get("transcript_path") or payload.get("transcriptPath") or ""
+    ).strip()
+    return Path(transcript).stem if transcript else ""
+
+
 def hub_enabled(args: argparse.Namespace | None = None) -> bool:
     if args is not None and getattr(args, "no_hub", False):
         return False
@@ -337,6 +358,7 @@ def send_anim_hub(anim: str, args: argparse.Namespace, payload: dict | None = No
             "source": source,
             "client_id": client_id(getattr(args, "client_id", None)),
             "client_kind": kind,
+            "session_id": payload_session_id(payload),
             "anim": anim,
             "event": event,
             "tool": tool,
@@ -362,12 +384,12 @@ def send_anim_hub(anim: str, args: argparse.Namespace, payload: dict | None = No
 
 
 def deliver_anim(anim: str, args: argparse.Namespace, payload: dict | None = None,
-                 event_time: float | None = None) -> bool:
+                 event_time: float | None = None) -> str | None:
     if hub_enabled(args):
         if send_anim_hub(anim, args, payload=payload, event_time=event_time):
-            return True
+            return "hub"
         if hub_required(args):
-            return False
+            return None
     send_anim(
         anim,
         transport=args.transport,
@@ -376,7 +398,7 @@ def deliver_anim(anim: str, args: argparse.Namespace, payload: dict | None = Non
         ble_address=args.ble_address,
         ble_name=args.ble_name,
     )
-    return True
+    return "direct"
 
 
 # ---------------------------------------------------------------------------
@@ -892,9 +914,9 @@ def main() -> int:
         event = payload.get("hook_event_name") or payload.get("event") or ""
         tool = payload.get("tool_name") or payload.get("toolName") or ""
         log(f"mapped event={event!r} tool={tool!r} anim={anim}")
-        deliver_anim(anim, args, payload=payload, event_time=event_time)
+        delivery_mode = deliver_anim(anim, args, payload=payload, event_time=event_time)
         # After Stop -> completion animation, spawn timer for idle then sleeping.
-        if event == "Stop":
+        if event == "Stop" and delivery_mode == "direct":
             spawn_timed_transition(event_time, args)
     else:
         ntype = payload.get("notification_type") or payload.get("type") or ""

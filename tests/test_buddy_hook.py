@@ -44,6 +44,19 @@ def test_buddy_shared_mapping_reuses_tool_categories():
     ) == "thinking"
 
 
+def test_payload_session_id_accepts_supported_platform_fields():
+    assert shared.payload_session_id({"session_id": "a"}) == "a"
+    assert shared.payload_session_id({"sessionId": "b"}) == "b"
+    assert shared.payload_session_id({"conversation_id": "c"}) == "c"
+    assert shared.payload_session_id({"conversationId": "d"}) == "d"
+    assert shared.payload_session_id({"thread_id": "e"}) == "e"
+    assert shared.payload_session_id({"threadId": "f"}) == "f"
+    assert shared.payload_session_id(
+        {"transcript_path": "/tmp/session-g.jsonl"}
+    ) == "session-g"
+    assert shared.payload_session_id(None) == ""
+
+
 def test_build_args_uses_platform_as_client_identity(monkeypatch):
     monkeypatch.setattr(
         sys,
@@ -93,6 +106,7 @@ def test_hub_enqueue_uses_platform_identity_without_full_payload(monkeypatch):
     payload = {
         "hook_event_name": "PreToolUse",
         "tool_name": "Write",
+        "session_id": "session-123",
         "tool_input": {"file_path": "/private/secret"},
         "prompt": "private prompt",
     }
@@ -104,11 +118,60 @@ def test_hub_enqueue_uses_platform_identity_without_full_payload(monkeypatch):
         "source": "codebuddy",
         "client_id": "codebuddy",
         "client_kind": "codebuddy",
+        "session_id": "session-123",
         "anim": "typing",
         "event": "PreToolUse",
         "tool": "Write",
         "event_time": None,
     }
+
+
+def test_buddy_stop_does_not_spawn_global_timer_after_hub_accepts(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["buddy-hook", "--platform", "workbuddy"],
+    )
+    monkeypatch.setattr(
+        shared,
+        "read_payload",
+        lambda: {"hook_event_name": "Stop", "session_id": "session-1"},
+    )
+    monkeypatch.setattr(shared, "touch_last_event", lambda: 123.0)
+    monkeypatch.setattr(shared, "deliver_anim", lambda *_a, **_kw: "hub")
+    monkeypatch.setattr(
+        shared,
+        "spawn_timed_transition",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("Hub-owned completion must not spawn a global timer")
+        ),
+    )
+
+    assert buddy.main() == 0
+
+
+def test_buddy_stop_keeps_legacy_timer_for_direct_delivery(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["buddy-hook", "--platform", "codebuddy", "--no-hub"],
+    )
+    monkeypatch.setattr(
+        shared,
+        "read_payload",
+        lambda: {"hook_event_name": "Stop", "session_id": "session-2"},
+    )
+    monkeypatch.setattr(shared, "touch_last_event", lambda: 456.0)
+    monkeypatch.setattr(shared, "deliver_anim", lambda *_a, **_kw: "direct")
+    monkeypatch.setattr(
+        shared,
+        "spawn_timed_transition",
+        lambda event_time, args: captured.append((event_time, args.platform)),
+    )
+
+    assert buddy.main() == 0
+    assert captured == [(456.0, "codebuddy")]
 
 
 def test_timed_transition_preserves_buddy_role_and_platform(monkeypatch):

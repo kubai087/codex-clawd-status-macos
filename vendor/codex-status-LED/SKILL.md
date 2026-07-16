@@ -21,8 +21,28 @@ transport result; a running process alone does not prove device delivery.
 | WorkBuddy | `~/.workbuddy/settings.json` | `workbuddy` |
 
 The shared Hub listens only on `http://127.0.0.1:8765`. Normal lifecycle
-events use `/enqueue`; the Hub coalesces rapid events and owns BLE-to-serial
-fallback. Platform hooks must exit zero and must never wait for device I/O.
+events use `/enqueue`; the Hub tracks platform sessions independently,
+arbitrates one aggregate state, coalesces only physical display updates, and
+owns BLE-to-serial fallback. Platform hooks must exit zero and must never wait
+for device I/O.
+
+Aggregate priority is `waiting > error > working > waiting_connection >
+complete > idle > sleeping`. A completed or sleeping session cannot hide
+another session that is still working. Codex Desktop and VS Code session logs
+are tailed concurrently by the one supervised watcher.
+
+## System Power Semantics
+
+macOS sleep is a hard override above aggregate task priority. On a normal
+system-will-sleep notification, the Hub clears all sessions and sends
+`sleeping` (`leds: 000`). While that override is active, lifecycle events are
+acknowledged as `system-masked` and are not retained. Wake, login, supervisor
+restart, and Hub restart publish `idle` with an empty client table; do not try
+to restore pre-sleep tasks.
+
+An abrupt Mac power loss cannot send a final command. If the ESP32 is powered
+independently, only a firmware watchdog that clears the LEDs after host
+heartbeats stop can guarantee that stale state is removed.
 
 ## Quick Reference
 
@@ -65,6 +85,9 @@ successful USB serial fallback is valid.
 ## Common Mistakes
 
 - Do not start separate Hubs for different platforms; port 8765 has one owner.
+- Do not interpret one session's completion as global completion; inspect the
+  `/state` aggregate and client table.
+- Do not restore client state after wake; the system power reset is intentional.
 - Do not install Python, Homebrew, or a virtual environment; the release is
   self-contained.
 - Do not hard-code a USB device path; serial discovery is intentional.

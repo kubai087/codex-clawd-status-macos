@@ -8,6 +8,11 @@ def test_pyinstaller_bundles_buddy_hook():
     assert '"buddy_clawd_hook"' in spec
 
 
+def test_pyinstaller_bundles_status_arbiter():
+    spec = Path("packaging/clawd-status.spec").read_text(encoding="utf-8")
+    assert '"status_arbiter"' in spec
+
+
 def test_bundled_skill_describes_all_supported_platforms():
     skill = Path("vendor/codex-status-LED/SKILL.md").read_text(encoding="utf-8")
     assert "Codex" in skill
@@ -31,5 +36,9 @@ def test_payload_contains_runtime_skill_and_license():
     assert (
         payload
         / "share/codex-clawd-status/skill/scripts/buddy_clawd_hook.py"
+    ).is_file()
+    assert (
+        payload
+        / "share/codex-clawd-status/skill/scripts/status_arbiter.py"
     ).is_file()
     assert (payload / "share/codex-clawd-status/LICENSE").is_file()

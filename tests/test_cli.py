@@ -7,7 +7,7 @@ def test_version_prints_package_version(capsys):
     with pytest.raises(SystemExit) as exc:
         main(["--version"])
     assert exc.value.code == 0
-    assert capsys.readouterr().out.strip() == "0.2.0"
+    assert capsys.readouterr().out.strip() == "0.3.0"
 
 
 def test_hook_role_dispatches_to_upstream_mapping(capsys):

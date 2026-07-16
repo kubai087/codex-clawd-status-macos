@@ -29,4 +29,5 @@ def test_release_archive_and_checksum():
         names = set(bundle.getnames())
     assert "payload/bin/clawd-status" in names
     assert "payload/share/codex-clawd-status/skill/SKILL.md" in names
+    assert "payload/share/codex-clawd-status/skill/scripts/status_arbiter.py" in names
     assert "payload/share/codex-clawd-status/LICENSE" in names
