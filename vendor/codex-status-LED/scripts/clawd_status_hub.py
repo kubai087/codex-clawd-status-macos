@@ -1291,7 +1291,9 @@ class HubState:
         original_anim = str(original_command.get("anim") or delivery.get("anim") or "").strip()
         semantic_status = str(delivery.get("status") or status_for_anim(original_anim))
         command = original_command
-        if (
+        if source != "manual" and semantic_status == "sleeping":
+            command = self.device_command({"leds": "000"})
+        elif (
             source != "manual"
             and self.use_status_effects
             and semantic_status in self.status_effects

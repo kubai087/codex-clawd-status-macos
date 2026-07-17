@@ -85,6 +85,15 @@ def test_error_expires_to_idle_then_sleeping():
     assert arbiter.evaluate(now=40.2).status == "sleeping"
 
 
+def test_waiting_connection_expires_to_idle_then_sleeping():
+    arbiter = StatusArbiter()
+    arbiter.update(event("workbuddy", "", "waiting_connection", "beacon"), now=0)
+
+    assert arbiter.evaluate(now=9.9).status == "waiting_connection"
+    assert arbiter.evaluate(now=10.1).status == "idle"
+    assert arbiter.evaluate(now=40.2).status == "sleeping"
+
+
 def test_idle_transitions_to_sleeping_after_thirty_seconds():
     arbiter = StatusArbiter()
     arbiter.update(event("codebuddy", "B", "idle", "idle"), now=5)

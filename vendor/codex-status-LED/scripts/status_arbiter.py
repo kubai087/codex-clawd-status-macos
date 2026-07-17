@@ -18,6 +18,7 @@ PRIORITY = {
 }
 
 PHASE_SECONDS = {
+    "waiting_connection": 10.0,
     "complete": 3.0,
     "error": 10.0,
     "idle": 30.0,
@@ -211,7 +212,11 @@ class StatusArbiter:
             if state.phase_deadline is None or now < state.phase_deadline:
                 return
             transition_at = state.phase_deadline
-            if state.semantic_status in {"complete", "error"}:
+            if state.semantic_status in {
+                "waiting_connection",
+                "complete",
+                "error",
+            }:
                 state.semantic_status = "idle"
                 state.anim = TRANSITION_ANIM["idle"]
                 state.updated_at = transition_at

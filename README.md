@@ -47,13 +47,18 @@ yields to another active session. Codex Desktop and VS Code session logs are
 tailed concurrently by the same supervised watcher. BLE and USB writes remain
 serialized through one delivery worker.
 
+Connection notifications hold for ten seconds, then transition through idle to
+sleeping instead of occupying the display indefinitely.
+
 Existing settings and unrelated hooks are preserved. The installer safely
 migrates the earlier Python/venv CodeBuddy and WorkBuddy hook when present.
 
 ## Mac sleep, wake, and restart
 
 macOS power state overrides every task priority. Before normal system sleep,
-the supervisor clears all task sessions and sends `sleeping` (`leds: 000`).
+the supervisor clears all task sessions and sends `sleeping` (`leds: 000`). All
+non-manual sleeping states use this explicit all-off command even when custom
+status effects are disabled.
 Task events received during sleep are acknowledged but discarded. After wake,
 login, service restart, or Hub restart, the runtime starts from `idle`; it never
 restores task state captured before sleep.

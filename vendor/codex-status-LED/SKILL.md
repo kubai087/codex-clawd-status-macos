@@ -35,10 +35,16 @@ are tailed concurrently by the one supervised watcher.
 
 macOS sleep is a hard override above aggregate task priority. On a normal
 system-will-sleep notification, the Hub clears all sessions and sends
-`sleeping` (`leds: 000`). While that override is active, lifecycle events are
+`sleeping` (`leds: 000`). All non-manual sleeping states use this explicit
+all-off command even when custom status effects are disabled. While that
+override is active, lifecycle events are
 acknowledged as `system-masked` and are not retained. Wake, login, supervisor
 restart, and Hub restart publish `idle` with an empty client table; do not try
 to restore pre-sleep tasks.
+
+`waiting_connection` is transient: it holds for ten seconds, then transitions
+to idle and follows the normal idle-to-sleeping timeout. A generic notification
+must not occupy the display indefinitely.
 
 Failed wake-time `idle` delivery retries in the background with bounded
 backoff, and any newer display state cancels the old retry. The Hub caches the

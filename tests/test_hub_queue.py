@@ -593,6 +593,44 @@ def test_system_delivery_does_not_create_a_task_client():
     assert hub.snapshot()["clients"] == {}
 
 
+def test_non_manual_sleeping_forces_explicit_all_off():
+    deliveries = (
+        {
+            "source": "system",
+            "client_id": "macos-power",
+            "client_kind": "system",
+            "status": "sleeping",
+            "anim": "sleeping",
+        },
+        {
+            "source": "workbuddy",
+            "client_id": "workbuddy",
+            "client_kind": "workbuddy",
+            "session_id": "A",
+            "status": "sleeping",
+            "anim": "sleeping",
+        },
+    )
+
+    for use_status_effects in (False, True):
+        for delivery in deliveries:
+            hub = HubState(hub_args(), start_scheduler=False)
+            hub.use_status_effects = use_status_effects
+            hub.status_effects["sleeping"] = {"anim": "beacon"}
+            sent = []
+
+            def capture(command, transport):
+                sent.append((command, transport))
+                return True, transport
+
+            hub.send_by_transport = capture
+
+            result = hub.deliver(delivery)
+
+            assert result["status"] == "delivered"
+            assert sent == [({"auto": False, "leds": "000"}, "ble")]
+
+
 def test_in_flight_task_cannot_restore_state_after_system_sleep():
     hub = HubState(hub_args(), start_scheduler=False)
     queue = CaptureQueue()
