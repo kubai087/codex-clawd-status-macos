@@ -67,6 +67,9 @@ When a wake-time `idle` command reaches macOS before Bluetooth is ready, the
 delivery worker retries in the background with bounded backoff. A newer task
 state supersedes that retry. The last successful CoreBluetooth device address
 is cached so healthy wake cycles can reconnect directly without a fresh scan.
+If macOS still owns the connection but the ESP32 is no longer advertising, the
+Hub retrieves that system-connected peripheral and rebuilds its local GATT
+session instead of waiting indefinitely for an advertising packet.
 
 This behavior covers normal macOS sleep and graceful shutdown. If the Mac loses
 power abruptly while the ESP32 has an independent power source, the Mac cannot

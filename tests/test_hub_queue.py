@@ -88,17 +88,32 @@ def test_ble_reset_with_clear_removes_persistent_address(monkeypatch):
     assert saved == [None]
 
 
-def test_failed_cached_target_is_cleared_before_retry_scan(monkeypatch):
+def test_failed_cached_target_is_preserved_for_corebluetooth_recovery(monkeypatch):
     saved = []
 
+    device = types.SimpleNamespace(
+        address="cached-uuid",
+        name="Claude-Mochi-Tank",
+    )
+
     class FailingClient:
-        def __init__(self, _target, timeout):
-            assert timeout == 5.0
+        def __init__(self, target, timeout):
+            assert target is device
+            assert timeout == 3.0
 
         async def connect(self):
             raise RuntimeError("stale target")
 
-    bleak = types.SimpleNamespace(BleakClient=FailingClient, BleakScanner=object)
+    class Scanner:
+        @staticmethod
+        async def discover(timeout):
+            assert timeout == 2.0
+            return []
+
+    async def recovered():
+        return [device]
+
+    bleak = types.SimpleNamespace(BleakClient=FailingClient, BleakScanner=Scanner)
     monkeypatch.setitem(sys.modules, "bleak", bleak)
     monkeypatch.setattr(hub_module, "write_cached_ble_address", saved.append)
     session = object.__new__(BleSession)
@@ -106,14 +121,108 @@ def test_failed_cached_target_is_cleared_before_retry_scan(monkeypatch):
     session.address = "cached-uuid"
     session.name = "Claude-Mochi-Tank"
     session.client = None
+    session._corebluetooth_candidates = recovered
 
     ok, message = asyncio.run(session._connect())
 
     assert ok is False
     assert "stale target" in message
-    assert session.target is None
-    assert session.address is None
-    assert saved == [None]
+    assert session.target == "cached-uuid"
+    assert session.address == "cached-uuid"
+    assert saved == []
+
+
+def test_system_connected_device_is_reused_without_advertising_scan(monkeypatch):
+    saved = []
+    device = types.SimpleNamespace(
+        address="recovered-uuid",
+        name="Claude-Mochi-Tank",
+    )
+
+    class Client:
+        def __init__(self, target, timeout):
+            assert target is device
+            assert timeout == 3.0
+            self.is_connected = False
+
+        async def connect(self):
+            self.is_connected = True
+
+    class Scanner:
+        @staticmethod
+        async def discover(timeout):
+            raise AssertionError("advertising scan should not run")
+
+    async def recovered():
+        return [device]
+
+    bleak = types.SimpleNamespace(BleakClient=Client, BleakScanner=Scanner)
+    monkeypatch.setitem(sys.modules, "bleak", bleak)
+    monkeypatch.setattr(hub_module, "write_cached_ble_address", saved.append)
+    session = object.__new__(BleSession)
+    session.target = None
+    session.address = None
+    session.name = "Claude-Mochi-Tank"
+    session.client = None
+    session._corebluetooth_candidates = recovered
+
+    ok, message = asyncio.run(session._connect())
+
+    assert ok is True
+    assert "recovered-uuid" in message
+    assert session.target == "recovered-uuid"
+    assert session.address == "recovered-uuid"
+    assert saved == ["recovered-uuid"]
+
+
+def test_advertising_replacement_supersedes_stale_cached_device(monkeypatch):
+    saved = []
+    stale = types.SimpleNamespace(
+        address="cached-uuid",
+        name="Claude-Mochi-Tank",
+    )
+    replacement = types.SimpleNamespace(
+        address="replacement-uuid",
+        name="Claude-Mochi-Tank",
+    )
+
+    class Client:
+        def __init__(self, target, timeout):
+            assert timeout == 3.0
+            self.target = target
+            self.is_connected = False
+
+        async def connect(self):
+            if self.target is stale:
+                raise RuntimeError("stale target")
+            self.is_connected = True
+
+    class Scanner:
+        @staticmethod
+        async def discover(timeout):
+            assert timeout == 2.0
+            return [replacement]
+
+    async def recovered():
+        return [stale]
+
+    bleak = types.SimpleNamespace(BleakClient=Client, BleakScanner=Scanner)
+    monkeypatch.setitem(sys.modules, "bleak", bleak)
+    monkeypatch.setattr(hub_module, "write_cached_ble_address", saved.append)
+    session = object.__new__(BleSession)
+    session.target = "cached-uuid"
+    session.address = "cached-uuid"
+    session.name = "Claude-Mochi-Tank"
+    session.client = None
+    session._corebluetooth_candidates = recovered
+
+    ok, message = asyncio.run(session._connect())
+
+    assert ok is True
+    assert "replacement-uuid" in message
+    assert session.target == "replacement-uuid"
+    assert session.address == "replacement-uuid"
+    assert saved == ["replacement-uuid"]
 
 
 def test_ble_send_cancels_timed_out_coroutine(monkeypatch):

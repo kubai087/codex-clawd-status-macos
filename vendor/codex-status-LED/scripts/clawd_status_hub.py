@@ -379,6 +379,113 @@ class BleSession:
             self.client = None
             return False, f"BLE failed: {exc}"
 
+    async def _corebluetooth_candidates(self) -> list[Any]:
+        """Recover peripherals macOS already knows without waiting for advertising.
+
+        CoreBluetooth can keep a peripheral connected at the system level after
+        sleep even though a new process has no local GATT connection. A regular
+        Bleak scan cannot see that peripheral until it advertises again, so use
+        the native retrieval APIs and hand Bleak the resulting BLEDevice object.
+        """
+        if sys.platform != "darwin":
+            return []
+
+        try:
+            from CoreBluetooth import CBUUID  # type: ignore
+            from Foundation import NSUUID  # type: ignore
+            from bleak.backends.corebluetooth.CentralManagerDelegate import (  # type: ignore
+                CentralManagerDelegate,
+            )
+            from bleak.backends.device import BLEDevice  # type: ignore
+
+            delegate = CentralManagerDelegate.alloc().init()
+            manager = delegate.central_manager
+            connected = list(
+                manager.retrieveConnectedPeripheralsWithServices_(
+                    [CBUUID.UUIDWithString_(bridge.BLE_SERVICE_UUID)]
+                )
+                or []
+            )
+
+            remembered: list[Any] = []
+            if self.target:
+                try:
+                    identifier = NSUUID.alloc().initWithUUIDString_(self.target)
+                except Exception:
+                    identifier = None
+                if identifier is not None:
+                    remembered = list(
+                        manager.retrievePeripheralsWithIdentifiers_([identifier]) or []
+                    )
+
+            def address(peripheral: Any) -> str:
+                return str(peripheral.identifier().UUIDString())
+
+            def matching_name(peripheral: Any) -> bool:
+                return bool(
+                    peripheral.name()
+                    and str(peripheral.name()).startswith(self.name)
+                )
+
+            selected = next(
+                (
+                    peripheral
+                    for peripheral in connected
+                    if self.target
+                    and address(peripheral).casefold() == self.target.casefold()
+                ),
+                None,
+            )
+            if selected is None:
+                selected = next(
+                    (peripheral for peripheral in connected if matching_name(peripheral)),
+                    None,
+                )
+            if selected is None:
+                selected = next(
+                    (
+                        peripheral
+                        for peripheral in remembered
+                        if self.target
+                        and address(peripheral).casefold() == self.target.casefold()
+                    ),
+                    None,
+                )
+            if selected is None:
+                return []
+
+            device = BLEDevice(
+                address(selected),
+                str(selected.name()) if selected.name() else None,
+                (selected, delegate),
+            )
+            log(f"BLE recovered CoreBluetooth peripheral address={device.address}")
+            return [device]
+        except Exception as exc:
+            log(f"BLE CoreBluetooth recovery unavailable: {exc}")
+            return []
+
+    def _matches_ble_device(self, device: Any) -> bool:
+        address = str(getattr(device, "address", "") or "")
+        name = str(getattr(device, "name", "") or "")
+        return bool(
+            (self.target and address.casefold() == self.target.casefold())
+            or (name and name.startswith(self.name))
+        )
+
+    async def _connect_candidate(self, client_type: Any, device: Any) -> tuple[bool, str]:
+        try:
+            client = client_type(device, timeout=3.0)
+            await client.connect()
+            self.client = client
+            self.target = str(device.address)
+            self.address = self.target
+            write_cached_ble_address(self.target)
+            return True, f"BLE connected {self.target}"
+        except Exception as exc:
+            self.client = None
+            return False, str(exc)
+
     async def _connect(self) -> tuple[bool, str]:
         try:
             from bleak import BleakClient, BleakScanner  # type: ignore
@@ -388,28 +495,41 @@ class BleSession:
         if self.client is not None and self.client.is_connected:
             return True, f"BLE connected {self.target}"
 
-        if not self.target:
-            devices = await BleakScanner.discover(timeout=2.5)
-            for device in devices:
-                if (device.name or "").startswith(self.name):
-                    self.target = device.address
-                    self.address = self.target
-                    write_cached_ble_address(self.target)
-                    break
-        if not self.target:
-            return False, f"BLE device not found name={self.name!r}"
+        errors: list[str] = []
+        recovered = await self._corebluetooth_candidates()
+        if recovered:
+            ok, message = await self._connect_candidate(BleakClient, recovered[0])
+            if ok:
+                return True, message
+            errors.append(message)
 
         try:
-            self.client = BleakClient(self.target, timeout=5.0)
-            await self.client.connect()
-            write_cached_ble_address(self.target)
-            return True, f"BLE connected {self.target}"
+            devices = await BleakScanner.discover(timeout=2.0)
         except Exception as exc:
-            self.client = None
-            self.target = None
-            self.address = None
-            write_cached_ble_address(None)
-            return False, f"BLE connect failed: {exc}"
+            devices = []
+            errors.append(f"scan failed: {exc}")
+
+        candidates = [device for device in devices if self._matches_ble_device(device)]
+        candidates.sort(
+            key=lambda device: not bool(
+                self.target
+                and str(getattr(device, "address", "")).casefold()
+                == self.target.casefold()
+            )
+        )
+        if candidates:
+            ok, message = await self._connect_candidate(BleakClient, candidates[0])
+            if ok:
+                return True, message
+            errors.append(message)
+
+        if errors:
+            # Keep the last known UUID. On macOS it is the only handle that can
+            # recover a system-connected peripheral which is no longer advertising.
+            return False, f"BLE connect failed: {'; '.join(errors)}"
+        if self.target:
+            return False, f"BLE device not found address={self.target!r}"
+        return False, f"BLE device not found name={self.name!r}"
 
     async def _disconnect(self) -> tuple[bool, str]:
         if self.client is None:
