@@ -42,10 +42,12 @@ that is still working or waiting for confirmation. The display priority is:
 waiting > error > working > waiting connection > complete > idle > sleeping
 ```
 
-Completion holds for three seconds, error holds for ten seconds, and only then
-yields to another active session. Codex Desktop and VS Code session logs are
-tailed concurrently by the same supervised watcher. BLE and USB writes remain
-serialized through one delivery worker.
+A completion remains transient for three seconds while another actionable
+session exists. When the final task completes, green remains latched until new
+activity, that session explicitly ends, macOS sleeps, or the Hub restarts.
+Codex Desktop and VS Code session logs are tailed concurrently by the same
+supervised watcher. BLE and USB writes remain serialized through one delivery
+worker.
 
 Connection notifications hold for ten seconds, then transition through idle to
 sleeping instead of occupying the display indefinitely.

@@ -31,6 +31,10 @@ complete > idle > sleeping`. A completed or sleeping session cannot hide
 another session that is still working. Codex Desktop and VS Code session logs
 are tailed concurrently by the one supervised watcher.
 
+Completion is conditional: it remains transient while another actionable
+session exists, but the final task's `complete` state stays latched green until
+new activity, an explicit end for that session, macOS sleep, or Hub restart.
+
 ## System Power Semantics
 
 macOS sleep is a hard override above aggregate task priority. On a normal
@@ -92,7 +96,9 @@ successful USB serial fallback is valid.
 - read/search: `debugger`
 - permission or elicitation: `confused`
 - tool/stop failure: `dizzy`
-- completion: `happy`, then `idle`, then `sleeping`
+- completion while another task is actionable: transient `happy`
+- final task completion: latched `happy` until new activity, explicit session
+  end, macOS sleep, or Hub restart
 
 ## Common Mistakes
 

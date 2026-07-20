@@ -29,6 +29,11 @@ STALE_SECONDS = {
     "waiting": 30.0 * 60.0,
 }
 
+ACTIONABLE_STATUSES = frozenset(
+    {"waiting", "error", "working", "waiting_connection"}
+)
+COMPLETION_RESET_STATUSES = ACTIONABLE_STATUSES | {"idle"}
+
 TRANSITION_ANIM = {
     "idle": "idle",
     "sleeping": "sleeping",
@@ -59,6 +64,7 @@ class ClientState:
     updated_at: float
     phase_deadline: float | None
     stale_at: float | None
+    completion_latched: bool = False
     display_role: str = "masked"
 
 
@@ -95,6 +101,23 @@ class StatusArbiter:
         status = str(delivery.get("status") or "working").strip()
         if status not in PRIORITY:
             status = "working"
+
+        for state in self.clients.values():
+            self._advance(state, timestamp)
+
+        if status in COMPLETION_RESET_STATUSES:
+            self._clear_latched_completions(timestamp)
+
+        completion_latched = False
+        if status == "complete":
+            completion_latched = not any(
+                state.client_key != key
+                and state.semantic_status in ACTIONABLE_STATUSES
+                for state in self.clients.values()
+            )
+            if completion_latched:
+                self._clear_latched_completions(timestamp)
+
         phase_seconds = PHASE_SECONDS.get(status)
         stale_seconds = STALE_SECONDS.get(status)
         self.clients[key] = ClientState(
@@ -113,13 +136,27 @@ class StatusArbiter:
             tool=str(delivery.get("tool") or ""),
             updated_at=timestamp,
             phase_deadline=(
-                timestamp + phase_seconds if phase_seconds is not None else None
+                timestamp + phase_seconds
+                if phase_seconds is not None and not completion_latched
+                else None
             ),
             stale_at=(
                 timestamp + stale_seconds if stale_seconds is not None else None
             ),
+            completion_latched=completion_latched,
         )
         return self.evaluate(timestamp)
+
+    def _clear_latched_completions(self, now: float) -> None:
+        for state in self.clients.values():
+            if not state.completion_latched:
+                continue
+            state.semantic_status = "sleeping"
+            state.anim = TRANSITION_ANIM["sleeping"]
+            state.updated_at = now
+            state.phase_deadline = None
+            state.stale_at = None
+            state.completion_latched = False
 
     def evaluate(self, now: float | None = None) -> Decision:
         timestamp = self.clock() if now is None else float(now)
@@ -208,6 +245,7 @@ class StatusArbiter:
                 state.updated_at = transition_at
                 state.phase_deadline = None
                 state.stale_at = None
+                state.completion_latched = False
                 continue
             if state.phase_deadline is None or now < state.phase_deadline:
                 return
@@ -222,6 +260,7 @@ class StatusArbiter:
                 state.updated_at = transition_at
                 state.phase_deadline = transition_at + PHASE_SECONDS["idle"]
                 state.stale_at = None
+                state.completion_latched = False
                 continue
             if state.semantic_status == "idle":
                 state.semantic_status = "sleeping"
@@ -229,8 +268,10 @@ class StatusArbiter:
                 state.updated_at = transition_at
                 state.phase_deadline = None
                 state.stale_at = None
+                state.completion_latched = False
                 continue
             state.phase_deadline = None
+            state.completion_latched = False
             return
 
     @staticmethod

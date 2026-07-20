@@ -143,7 +143,7 @@ The arbiter chooses the highest-ranked eligible session:
 | 40 | `error` | Holds attention for 10 seconds, then transitions to idle unless updated. |
 | 30 | `working` | Remains eligible while active; stale protection prevents permanent lock. |
 | 25 | `waiting_connection` | Shows connection-related attention below task work. |
-| 20 | `complete` | Holds for 3 seconds, then transitions to idle. |
+| 20 | `complete` | Holds for 3 seconds while another actionable session exists; the final completion stays latched. |
 | 10 | `idle` | Eligible only when no actionable or active session exists; transitions to sleeping after 30 seconds. |
 | 0 | `sleeping` | Eligible only when every known session is inactive or sleeping. |
 
@@ -159,8 +159,10 @@ terminal event; normal `Stop`, `SessionEnd`, and resumed activity update the
 entry before the lease expires.
 
 When a timed state expires, a Hub arbitration clock recomputes the effective
-state even if no new platform event arrives. This is required for a completed
-task to yield back to another working task after three seconds.
+state even if no new platform event arrives. A completion remains transient
+when another actionable session exists. Once the final task completes, its
+green completion state has no deadline and stays latched until new activity,
+an explicit session end, macOS sleep, or Hub restart.
 
 ## Lifecycle Semantics
 

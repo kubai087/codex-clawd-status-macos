@@ -1230,6 +1230,7 @@ class HubState:
                     "last_at": arbiter_state.updated_at,
                     "phase_deadline": arbiter_state.phase_deadline,
                     "stale_at": arbiter_state.stale_at,
+                    "completion_latched": arbiter_state.completion_latched,
                 }
             )
             for hook_state in client.get("hooks", {}).values():

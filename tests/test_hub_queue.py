@@ -567,7 +567,43 @@ def test_waiting_preempts_working_and_is_the_only_new_physical_command():
     assert hub.snapshot()["current_client_key"] == "workbuddy:C"
 
 
-def test_recompute_after_completion_expiry_restores_working_session():
+def test_completion_stays_transient_while_another_session_is_working():
+    now = [0.0]
+    hub = HubState(hub_args(), clock=lambda: now[0], start_scheduler=False)
+    queue = CaptureQueue()
+    hub.delivery_queue = queue
+
+    hub.enqueue(
+        {
+            "source": "codex",
+            "client_id": "codex-desktop",
+            "client_kind": "codex",
+            "session_id": "A",
+            "anim": "thinking",
+        }
+    )
+    now[0] = 0.1
+    hub.enqueue(
+        {
+            "source": "codebuddy",
+            "client_id": "codebuddy",
+            "client_kind": "codebuddy",
+            "session_id": "B",
+            "anim": "happy",
+        }
+    )
+    now[0] = 3.11
+
+    changed = hub.recompute_aggregate(now=now[0])
+
+    state = hub.snapshot()
+    assert changed is False
+    assert state["aggregate"]["effective_client_key"] == "codex-desktop:A"
+    assert state["clients"]["codebuddy:B"]["semantic_status"] == "idle"
+    assert state["clients"]["codebuddy:B"]["completion_latched"] is False
+
+
+def test_final_completion_stays_latched_in_hub():
     now = [0.0]
     hub = HubState(hub_args(), clock=lambda: now[0], start_scheduler=False)
     queue = CaptureQueue()
@@ -582,24 +618,20 @@ def test_recompute_after_completion_expiry_restores_working_session():
             "anim": "happy",
         }
     )
-    now[0] = 0.1
-    hub.enqueue(
-        {
-            "source": "codex",
-            "client_id": "codex-desktop",
-            "client_kind": "codex",
-            "session_id": "A",
-            "anim": "thinking",
-        }
-    )
-    now[0] = 3.01
+    initial = hub.snapshot()
 
+    assert initial["current_status"] == "complete"
+    assert initial["clients"]["codebuddy:B"]["completion_latched"] is True
+    assert initial["clients"]["codebuddy:B"]["phase_deadline"] is None
+
+    now[0] = 3600
     changed = hub.recompute_aggregate(now=now[0])
 
+    final = hub.snapshot()
     assert changed is False
-    assert hub.snapshot()["aggregate"]["effective_client_key"] == (
-        "codex-desktop:A"
-    )
+    assert final["current_status"] == "complete"
+    assert final["clients"]["codebuddy:B"]["completion_latched"] is True
+    assert [item["anim"] for item in queue.items] == ["happy"]
 
 
 def test_system_sleep_clears_sessions_and_enqueues_sleeping():

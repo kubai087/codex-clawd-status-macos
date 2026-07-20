@@ -37,6 +37,8 @@ def test_working_survives_another_sessions_completion():
     assert decision.client_key == "codex-desktop:A"
     assert decision.status == "working"
     assert arbiter.clients["codebuddy:B"].display_role == "masked"
+    assert arbiter.clients["codebuddy:B"].completion_latched is False
+    assert arbiter.clients["codebuddy:B"].phase_deadline == 4
 
 
 def test_waiting_preempts_working_and_only_its_session_can_clear_it():
@@ -68,12 +70,53 @@ def test_error_preempts_working_but_waiting_preempts_error():
     assert decision.client_key == "workbuddy:C"
 
 
-def test_complete_expires_and_reveals_underlying_work():
+def test_single_complete_latches_until_new_activity():
+    arbiter = StatusArbiter()
+    decision = arbiter.update(event("codebuddy", "B", "complete", "happy"), now=0)
+
+    assert decision.status == "complete"
+    assert arbiter.clients["codebuddy:B"].completion_latched is True
+    assert arbiter.clients["codebuddy:B"].phase_deadline is None
+    assert arbiter.evaluate(now=3600).status == "complete"
+
+    decision = arbiter.update(
+        event("codex-desktop", "A", "working", "thinking"), now=3601
+    )
+
+    assert decision.client_key == "codex-desktop:A"
+    assert decision.status == "working"
+    assert arbiter.clients["codebuddy:B"].semantic_status == "sleeping"
+    assert arbiter.clients["codebuddy:B"].completion_latched is False
+
+
+def test_last_of_multiple_tasks_latches_complete():
+    arbiter = StatusArbiter()
+    arbiter.update(event("codex-desktop", "A", "working", "thinking"), now=0)
+    arbiter.update(event("codebuddy", "B", "working", "building"), now=0.1)
+
+    first = arbiter.update(event("codex-desktop", "A", "complete", "happy"), now=1)
+    final = arbiter.update(event("codebuddy", "B", "complete", "happy"), now=2)
+
+    assert first.client_key == "codebuddy:B"
+    assert first.status == "working"
+    assert arbiter.clients["codex-desktop:A"].completion_latched is False
+    assert final.client_key == "codebuddy:B"
+    assert final.status == "complete"
+    assert arbiter.clients["codebuddy:B"].completion_latched is True
+    assert arbiter.evaluate(now=3600).status == "complete"
+
+
+def test_session_end_clears_the_latched_completion():
     arbiter = StatusArbiter()
     arbiter.update(event("codebuddy", "B", "complete", "happy"), now=0)
-    arbiter.update(event("codex-desktop", "A", "working", "thinking"), now=0.1)
 
-    assert arbiter.evaluate(now=3.01).client_key == "codex-desktop:A"
+    decision = arbiter.update(
+        event("codebuddy", "B", "sleeping", "sleeping", event_name="SessionEnd"),
+        now=1,
+    )
+
+    assert decision.status == "sleeping"
+    assert arbiter.clients["codebuddy:B"].completion_latched is False
 
 
 def test_error_expires_to_idle_then_sleeping():
