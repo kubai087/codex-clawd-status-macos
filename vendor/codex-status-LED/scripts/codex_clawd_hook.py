@@ -86,7 +86,18 @@ MANAGE_TOOLS = {
     "TodoWrite", "TodoRead", "update_plan", "get_goal", "create_goal", "update_goal",
     "functions.update_plan", "functions.get_goal", "functions.create_goal", "functions.update_goal",
 }
-ASK_TOOLS    = {"AskUserQuestion", "AskFollowup", "request_user_input", "functions.request_user_input"}
+ASK_TOOLS    = {
+    "AskUserQuestion", "AskFollowup", "ExitPlanMode",
+    "request_user_input", "functions.request_user_input",
+    "request_permissions", "functions.request_permissions",
+    "request_plugin_install", "functions.request_plugin_install",
+}
+USER_APPROVAL_EVENTS = {
+    "PermissionRequest",
+    "ApprovalRequest",
+    "ElicitationRequest",
+    "UserInputRequest",
+}
 BEACON_HINTS = ("mcp", "lsp", "language", "context")
 
 
@@ -823,7 +834,7 @@ def payload_to_anim(payload: dict) -> str | None:
         return SESSION_IDLE_ANIM
     if event == "PreToolUse":
         return tool_to_anim(str(tool), tool_input)
-    if event == "PermissionRequest":
+    if event in USER_APPROVAL_EVENTS:
         return "confused"
     if event == "PostToolUse":
         # Once the tool has completed, Codex is back to reading the result and

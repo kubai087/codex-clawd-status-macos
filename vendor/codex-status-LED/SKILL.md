@@ -26,6 +26,15 @@ arbitrates one aggregate state, coalesces only physical display updates, and
 owns BLE-to-serial fallback. Platform hooks must exit zero and must never wait
 for device I/O.
 
+For Codex Desktop, user-blocking actions may appear as the current
+`tools.request_permissions` API, legacy escalated `exec_command` calls,
+interactive questions, plugin-install or plan-exit confirmation, and explicit
+MCP approval/elicitation items. Calls may be direct or nested inside an outer
+`exec`. All formats map to `confused` / `waiting`; the matching response or
+next lifecycle event resumes the session's normal state. CodeBuddy and
+WorkBuddy map native permission events and approval/elicitation notifications
+to the same waiting state.
+
 Aggregate priority is `waiting > error > working > waiting_connection >
 complete > idle > sleeping`. A completed or sleeping session cannot hide
 another session that is still working. Codex Desktop and VS Code session logs
@@ -34,6 +43,8 @@ are tailed concurrently by the one supervised watcher.
 Completion is conditional: it remains transient while another actionable
 session exists, but the final task's `complete` state stays latched green until
 new activity, an explicit end for that session, macOS sleep, or Hub restart.
+Codex `turn_aborted` deactivates only the aborted session immediately, rather
+than leaving its previous working state active until the stale timeout.
 
 ## System Power Semantics
 

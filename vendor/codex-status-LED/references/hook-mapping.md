@@ -37,7 +37,7 @@ dizzy, disconnected
 | `SessionStart` | `idle` | Session registered and waiting for work; configurable with `CLAWD_TANK_IDLE_ANIM` |
 | `UserPromptSubmit` | `thinking` | Codex starts reasoning before tools |
 | `PreToolUse` | tool-specific | Show the supported tool that is about to run |
-| `PermissionRequest` | `confused` | Codex is waiting for approval |
+| `PermissionRequest` | `confused` | Codex is waiting for approval; compatible approval, elicitation, and user-input event aliases use the same mapping |
 | `PostToolUse` | `thinking` | Tool finished; Codex is reading results and deciding the next step |
 | `PreCompact` | `sweeping` | Context compaction is about to start |
 | `PostCompact` | `thinking` | Compaction finished; Codex resumes processing |
@@ -59,7 +59,7 @@ namespaced. The hook checks both the full Codex name and the final leaf name, so
 | Web / generated media | Claude: `WebFetch`, `WebSearch`; Codex: `web.run`, `imagegen`, `image_gen.imagegen` | `wizard` |
 | Agent | `Task`, `Agent`, `Subagent` | `conducting` |
 | Task / goal management | Claude: `TodoWrite`, `TodoRead`; Codex: `update_plan`, `get_goal`, `create_goal`, `update_goal` | `juggling` |
-| Ask user | Claude: `AskUserQuestion`, `AskFollowup`; Codex: `request_user_input` | `confused` |
+| Wait for user | Claude: `AskUserQuestion`, `AskFollowup`, `ExitPlanMode`; Codex: `request_user_input`, `request_permissions`, `request_plugin_install`; explicit MCP approval/elicitation requests | `confused` |
 | MCP / LSP name hint | names containing `mcp`, `lsp`, `language`, or `context` | `beacon` |
 | Parallel tool wrapper | `multi_tool_use.parallel` | nested tools if unambiguous, otherwise `juggling` |
 | Unknown | anything else | `typing` |
@@ -106,6 +106,9 @@ the newest JSONL stream, switches as newer sessions appear, and maps:
 | --- | --- |
 | `event_msg` `user_message` | `thinking` |
 | `response_item` `function_call` / `custom_tool_call` | tool-specific |
+| direct or nested user approval tool | `confused` |
+| explicit approval / permission / elicitation request | `confused` |
+| approval / permission / elicitation response | `thinking` |
 | `response_item` `function_call_output` / `custom_tool_call_output` | `thinking` |
 | `event_msg` `task_complete` | completion animation, then timed idle/sleeping |
 

@@ -35,6 +35,51 @@ def test_buddy_extended_event_mapping():
     ) == "beacon"
 
 
+def test_buddy_all_user_approval_event_variants_map_to_waiting():
+    for event in (
+        "PermissionRequest",
+        "ApprovalRequest",
+        "ElicitationRequest",
+        "UserInputRequest",
+    ):
+        assert buddy.payload_to_anim({"hook_event_name": event}) == "confused"
+
+    for notification in (
+        "permission_prompt",
+        "permission_request",
+        "approval_prompt",
+        "approval_request",
+        "elicitation_dialog",
+        "elicitation_prompt",
+        "user_input_prompt",
+        "tool_permission_prompt",
+        "Approval-Prompt",
+    ):
+        assert buddy.payload_to_anim(
+            {
+                "hook_event_name": "Notification",
+                "notification_type": notification,
+            }
+        ) == "confused"
+
+
+def test_shared_tool_mapping_covers_user_facing_approval_tools_only():
+    for tool_name in (
+        "AskUserQuestion",
+        "AskFollowup",
+        "ExitPlanMode",
+        "request_user_input",
+        "functions.request_user_input",
+        "request_permissions",
+        "functions.request_permissions",
+        "request_plugin_install",
+        "functions.request_plugin_install",
+    ):
+        assert shared.tool_to_anim(tool_name) == "confused"
+
+    assert shared.tool_to_anim("mcp__plugin__update_app_permissions") == "beacon"
+
+
 def test_buddy_shared_mapping_reuses_tool_categories():
     assert buddy.payload_to_anim(
         {"hook_event_name": "PreToolUse", "tool_name": "Write"}

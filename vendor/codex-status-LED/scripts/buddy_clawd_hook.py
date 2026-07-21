@@ -9,17 +9,34 @@ import os
 import codex_clawd_hook as shared
 
 PLATFORMS = ("codebuddy", "workbuddy")
+WAITING_NOTIFICATION_TYPES = {
+    "permission_prompt",
+    "permission_request",
+    "approval_prompt",
+    "approval_request",
+    "elicitation_dialog",
+    "elicitation_prompt",
+    "user_input_prompt",
+    "tool_permission_prompt",
+}
 
 
 def payload_to_anim(payload: dict) -> str | None:
     event = payload.get("hook_event_name") or payload.get("event") or ""
+    if event in shared.USER_APPROVAL_EVENTS:
+        return "confused"
     if event in {"PostToolUseFailure", "StopFailure"}:
         return "dizzy"
     if event == "SessionEnd":
         return shared.SLEEP_ANIM
     if event == "Notification":
-        notification = str(payload.get("notification_type") or "")
-        if notification in {"permission_prompt", "elicitation_dialog"}:
+        notification = (
+            str(payload.get("notification_type") or "")
+            .strip()
+            .lower()
+            .replace("-", "_")
+        )
+        if notification in WAITING_NOTIFICATION_TYPES:
             return "confused"
         if notification == "idle_prompt":
             return shared.TASK_COMPLETE_ANIM

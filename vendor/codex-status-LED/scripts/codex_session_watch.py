@@ -13,6 +13,7 @@ import argparse
 from dataclasses import dataclass
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -219,13 +220,238 @@ def parse_tool_input(raw: Any) -> object | None:
     return None
 
 
-def wants_escalated_permission(tool_name: str, tool_input: object | None) -> bool:
-    if tool_name not in {"shell_command", "functions.shell_command"}:
-        return False
-    if not isinstance(tool_input, dict):
-        return False
-    value = str(tool_input.get("sandbox_permissions") or "")
-    return value == "require_escalated"
+JAVASCRIPT_TOOL_CALL = re.compile(
+    r"tools\.([A-Za-z_][A-Za-z0-9_]*)\s*\("
+)
+JAVASCRIPT_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+DIRECT_EXECUTION_TOOLS = {"exec_command", "shell_command"}
+WAITING_ITEM_TYPES = {
+    "approval_request",
+    "permission_request",
+    "elicitation_request",
+    "mcp_approval_request",
+}
+WAITING_EVENT_TYPES = WAITING_ITEM_TYPES | {"user_input_request"}
+APPROVAL_RESPONSE_TYPES = {
+    "approval_response",
+    "permission_response",
+    "elicitation_response",
+    "mcp_approval_response",
+}
+SESSION_DEACTIVATION_EVENT_TYPES = {"turn_aborted"}
+
+
+def javascript_tool_call_sites(source: str) -> list[tuple[str, int]]:
+    """Find tools.NAME(...) calls and argument offsets outside strings/comments."""
+    calls: list[tuple[str, int]] = []
+    index = 0
+    while index < len(source):
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            closing = source.find("*/", index + 2)
+            index = len(source) if closing < 0 else closing + 2
+            continue
+
+        char = source[index]
+        if char in {"'", '"', "`"}:
+            quote = char
+            index += 1
+            while index < len(source):
+                if source[index] == "\\":
+                    index += 2
+                    continue
+                if source[index] == quote:
+                    index += 1
+                    break
+                index += 1
+            continue
+
+        match = JAVASCRIPT_TOOL_CALL.match(source, index)
+        if match and (
+            index == 0
+            or not (source[index - 1].isalnum() or source[index - 1] in "_.$")
+        ):
+            calls.append((match.group(1), match.end()))
+            index = match.end()
+            continue
+        index += 1
+    return calls
+
+
+def javascript_tool_calls(source: str) -> list[str]:
+    return [name for name, _argument_offset in javascript_tool_call_sites(source)]
+
+
+def skip_javascript_trivia(source: str, index: int) -> int:
+    while index < len(source):
+        if source[index].isspace():
+            index += 1
+            continue
+        if source.startswith("//", index):
+            newline = source.find("\n", index + 2)
+            index = len(source) if newline < 0 else newline + 1
+            continue
+        if source.startswith("/*", index):
+            closing = source.find("*/", index + 2)
+            index = len(source) if closing < 0 else closing + 2
+            continue
+        break
+    return index
+
+
+def read_javascript_string(source: str, index: int) -> tuple[str, int]:
+    quote = source[index]
+    index += 1
+    value: list[str] = []
+    while index < len(source):
+        char = source[index]
+        if char == "\\" and index + 1 < len(source):
+            value.append(source[index + 1])
+            index += 2
+            continue
+        if char == quote:
+            return "".join(value), index + 1
+        value.append(char)
+        index += 1
+    return "".join(value), index
+
+
+def javascript_call_has_string_property(
+    source: str,
+    argument_offset: int,
+    property_name: str,
+    expected_value: str,
+) -> bool:
+    """Inspect one tools.NAME(...) call without matching strings or comments."""
+    index = argument_offset
+    paren_depth = 1
+    while index < len(source) and paren_depth:
+        index = skip_javascript_trivia(source, index)
+        if index >= len(source):
+            break
+
+        char = source[index]
+        if char in {"'", '"', "`"}:
+            key, index = read_javascript_string(source, index)
+            if char == "`" or key != property_name:
+                continue
+            value_offset = skip_javascript_trivia(source, index)
+            if value_offset >= len(source) or source[value_offset] != ":":
+                continue
+            value_offset = skip_javascript_trivia(source, value_offset + 1)
+            if (
+                value_offset >= len(source)
+                or source[value_offset] not in {"'", '"'}
+            ):
+                continue
+            value, index = read_javascript_string(source, value_offset)
+            if value == expected_value:
+                return True
+            continue
+        if char == "(":
+            paren_depth += 1
+            index += 1
+            continue
+        if char == ")":
+            paren_depth -= 1
+            index += 1
+            continue
+
+        match = JAVASCRIPT_IDENTIFIER.match(source, index)
+        if not match:
+            index += 1
+            continue
+        identifier = match.group(0)
+        index = match.end()
+        if identifier != property_name:
+            continue
+
+        value_offset = skip_javascript_trivia(source, index)
+        if value_offset >= len(source) or source[value_offset] != ":":
+            continue
+        value_offset = skip_javascript_trivia(source, value_offset + 1)
+        if value_offset >= len(source) or source[value_offset] not in {"'", '"'}:
+            continue
+        value, index = read_javascript_string(source, value_offset)
+        if value == expected_value:
+            return True
+    return False
+
+
+def nested_exec_command_inputs(source: str) -> list[dict[str, Any]]:
+    """Return JSON object arguments from orchestrated tools.exec_command calls."""
+    decoder = json.JSONDecoder()
+    inputs: list[dict[str, Any]] = []
+    for name, argument_offset in javascript_tool_call_sites(source):
+        if hook.normalize_tool_name(name) not in DIRECT_EXECUTION_TOOLS:
+            continue
+        try:
+            value, _ = decoder.raw_decode(source, argument_offset)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            inputs.append(value)
+    return inputs
+
+
+def nested_exec_command_requires_escalation(source: str) -> bool:
+    if any(
+        str(nested.get("sandbox_permissions") or "") == "require_escalated"
+        for nested in nested_exec_command_inputs(source)
+    ):
+        return True
+    return any(
+        hook.normalize_tool_name(name) in DIRECT_EXECUTION_TOOLS
+        and javascript_call_has_string_property(
+            source,
+            argument_offset,
+            "sandbox_permissions",
+            "require_escalated",
+        )
+        for name, argument_offset in javascript_tool_call_sites(source)
+    )
+
+
+def user_approval_kind(
+    tool_name: str,
+    tool_input: object | None,
+    raw_input: object | None = None,
+) -> str | None:
+    normalized = hook.normalize_tool_name(tool_name)
+    if normalized == "request_permissions":
+        return "permission_request"
+    if hook.tool_matches(tool_name, hook.ASK_TOOLS):
+        return "user_approval"
+    if normalized in DIRECT_EXECUTION_TOOLS and isinstance(tool_input, dict):
+        value = str(tool_input.get("sandbox_permissions") or "")
+        return "permission_request" if value == "require_escalated" else None
+
+    if normalized != "exec" or not isinstance(raw_input, str):
+        return None
+
+    nested_tools = javascript_tool_calls(raw_input)
+    if any(
+        hook.normalize_tool_name(name) == "request_permissions"
+        for name in nested_tools
+    ):
+        return "permission_request"
+    if any(hook.tool_matches(name, hook.ASK_TOOLS) for name in nested_tools):
+        return "user_approval"
+    if nested_exec_command_requires_escalation(raw_input):
+        return "permission_request"
+    return None
+
+
+def wants_escalated_permission(
+    tool_name: str,
+    tool_input: object | None,
+    raw_input: object | None = None,
+) -> bool:
+    """Compatibility predicate retained for callers of the earlier helper."""
+    return user_approval_kind(tool_name, tool_input, raw_input) == "permission_request"
 
 
 def item_to_anim(item: dict[str, Any]) -> tuple[str | None, str]:
@@ -233,24 +459,34 @@ def item_to_anim(item: dict[str, Any]) -> tuple[str | None, str]:
     payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}
 
     if item_type == "event_msg":
-        event_type = payload.get("type")
+        event_type = str(payload.get("type") or "").lower().replace("-", "_")
         if event_type == "user_message":
             return "thinking", "session user_message"
         if event_type == "agent_message":
             return "thinking", "session agent_message"
         if event_type == "task_complete":
             return hook.TASK_COMPLETE_ANIM, "session task_complete"
+        if event_type in SESSION_DEACTIVATION_EVENT_TYPES:
+            return hook.SLEEP_ANIM, f"session {event_type}"
+        if event_type in WAITING_EVENT_TYPES:
+            return "confused", f"session {event_type}"
         return None, ""
 
     if item_type != "response_item":
         return None, ""
 
-    payload_type = payload.get("type")
+    payload_type = str(payload.get("type") or "").lower().replace("-", "_")
+    if payload_type in WAITING_ITEM_TYPES:
+        return "confused", f"session {payload_type}"
+    if payload_type in APPROVAL_RESPONSE_TYPES:
+        return "thinking", f"session {payload_type}"
     if payload_type in {"function_call", "custom_tool_call"}:
         name = str(payload.get("name") or "")
-        tool_input = parse_tool_input(payload.get("arguments") or payload.get("input"))
-        if wants_escalated_permission(name, tool_input):
-            return "confused", f"session permission_request tool={name!r}"
+        raw_input = payload.get("arguments") or payload.get("input")
+        tool_input = parse_tool_input(raw_input)
+        approval_kind = user_approval_kind(name, tool_input, raw_input)
+        if approval_kind:
+            return "confused", f"session {approval_kind} tool={name!r}"
         anim = hook.tool_to_anim(name, tool_input)
         return anim, f"session {payload_type} tool={name!r}"
 

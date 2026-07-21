@@ -32,6 +32,17 @@ The bundled skill is linked into each platform's user-level skill directory.
 All platforms share one LaunchAgent, Hub, self-contained runtime, and ESP32
 transport. Uninstalled platforms remain dormant and work when installed later.
 
+Any action that pauses for the user is published as the high-priority waiting
+state and shown with the yellow `confused` animation. This includes current
+`tools.request_permissions` calls, legacy escalated commands, interactive user
+questions, plugin-install confirmation, plan-exit approval, and MCP
+approval/elicitation. CodeBuddy and WorkBuddy use their native
+`PermissionRequest` and approval/elicitation notification events.
+
+The next response or lifecycle event for that same session clears its waiting
+state. Other sessions remain independent, so one approval can preempt the
+display without erasing ongoing work, completion, or sleep state elsewhere.
+
 ## Concurrent tasks
 
 The Hub tracks each IDE session independently and sends only one aggregate
@@ -45,6 +56,8 @@ waiting > error > working > waiting connection > complete > idle > sleeping
 A completion remains transient for three seconds while another actionable
 session exists. When the final task completes, green remains latched until new
 activity, that session explicitly ends, macOS sleeps, or the Hub restarts.
+An aborted Codex turn immediately deactivates only that session, so it cannot
+leave a stale working animation masking the final completion of another task.
 Codex Desktop and VS Code session logs are tailed concurrently by the same
 supervised watcher. BLE and USB writes remain serialized through one delivery
 worker.
